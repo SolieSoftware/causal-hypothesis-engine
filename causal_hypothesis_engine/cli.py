@@ -4,6 +4,7 @@ causal-engine new                — start new network + DAGAgent session
 causal-engine resume <id>        — resume an interrupted session
 causal-engine resume --last      — resume the most recent session
 causal-engine list               — list all networks and versions
+causal-engine modify <version-id> — start ModificationAgent session
 causal-engine doctor             — check environment
 """
 
@@ -18,8 +19,9 @@ from rich.console import Console
 from rich.table import Table
 
 from .agents.dag_agent import DAGAgent, DraftState
+from .agents.modification_agent import ModificationAgent
 from .models.network import AdapterType, HypothesisNetwork
-from .models.session import SessionMode, SessionStatus
+from .models.session import ModificationMode, SessionMode, SessionStatus
 from .persistence.checkpoint import load_checkpoint
 from .persistence.db import Database
 
@@ -248,6 +250,51 @@ def list_networks() -> None:
 # ---------------------------------------------------------------------------
 # doctor
 # ---------------------------------------------------------------------------
+
+
+@cli.command()
+@click.argument("version_id")
+@click.option(
+    "--mode",
+    "-m",
+    type=click.Choice(["theory", "backtest", "hybrid"], case_sensitive=False),
+    default="theory",
+    help="Modification mode (default: theory).",
+)
+def modify(version_id: str, mode: str) -> None:
+    """Start a ModificationAgent session on an existing DAGVersion."""
+    _validate_env()
+    db = _get_db()
+
+    version = db.get_version(version_id)
+    if version is None:
+        console.print(
+            f"[bold red][ERROR][/bold red] Problem: Version [bold]{version_id}[/bold] not found.\n"
+            "  Fix: Run [bold]causal-engine list[/bold] to see available version IDs."
+        )
+        sys.exit(1)
+
+    network = db.get_network(version.network_id)
+    if network is None:
+        console.print(
+            f"[bold red][ERROR][/bold red] Problem: Network for version not found.\n"
+            "  Cause: network_id={version.network_id} missing from database."
+        )
+        sys.exit(1)
+
+    mode_map = {
+        "theory": ModificationMode.Theory,
+        "backtest": ModificationMode.Backtest,
+        "hybrid": ModificationMode.Hybrid,
+    }
+    agent = ModificationAgent(
+        db=db,
+        network=network,
+        source_version=version,
+        modification_mode=mode_map[mode.lower()],
+        checkpoint_dir=_DEFAULT_CHECKPOINT_DIR,
+    )
+    agent.run(console)
 
 
 @cli.command()
