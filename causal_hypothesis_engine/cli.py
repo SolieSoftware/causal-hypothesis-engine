@@ -5,6 +5,7 @@ causal-engine resume <id>        — resume an interrupted session
 causal-engine resume --last      — resume the most recent session
 causal-engine list               — list all networks and versions
 causal-engine modify <version-id> — start ModificationAgent session
+causal-engine backtest <version-id> --data <path> — run BacktestAgent
 causal-engine doctor             — check environment
 """
 
@@ -18,6 +19,7 @@ import click
 from rich.console import Console
 from rich.table import Table
 
+from .agents.backtest_agent import BacktestAgent, BacktestPreflightError, check_can_backtest
 from .agents.dag_agent import DAGAgent, DraftState
 from .agents.modification_agent import ModificationAgent
 from .models.network import AdapterType, HypothesisNetwork
@@ -295,6 +297,48 @@ def modify(version_id: str, mode: str) -> None:
         checkpoint_dir=_DEFAULT_CHECKPOINT_DIR,
     )
     agent.run(console)
+
+
+@cli.command()
+@click.argument("version_id")
+@click.option(
+    "--data",
+    "-d",
+    required=True,
+    type=click.Path(exists=True, dir_okay=False),
+    help="Path to the CSV or Parquet data file.",
+)
+def backtest(version_id: str, data: str) -> None:
+    """Run BacktestAgent on a DAGVersion and attach the result."""
+    db = _get_db()
+
+    version = db.get_version(version_id)
+    if version is None:
+        console.print(
+            f"[bold red][ERROR][/bold red] Problem: Version [bold]{version_id}[/bold] not found.\n"
+            "  Fix: Run [bold]causal-engine list[/bold] to see available version IDs."
+        )
+        sys.exit(1)
+
+    network = db.get_network(version.network_id)
+    if network is None:
+        console.print(
+            "[bold red][ERROR][/bold red] Problem: Network for version not found."
+        )
+        sys.exit(1)
+
+    try:
+        check_can_backtest(network, version)
+    except BacktestPreflightError as exc:
+        console.print(f"[bold red][ERROR][/bold red] {exc}")
+        sys.exit(1)
+
+    try:
+        agent = BacktestAgent(db=db, network=network, version=version, data_path=data)
+        agent.run(console)
+    except (FileNotFoundError, ValueError) as exc:
+        console.print(f"[bold red][ERROR][/bold red] {exc}")
+        sys.exit(1)
 
 
 @cli.command()
