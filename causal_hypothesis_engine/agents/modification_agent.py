@@ -1,9 +1,9 @@
 """ModificationAgent — human-in-the-loop DAG modification agent.
 
 Three modes (controlled by Session.modification_mode):
-  THEORY   — pure causal reasoning, no data required (step 5, implemented here)
-  BACKTEST — data-driven proposals from backtest results (step 8)
-  HYBRID   — theory + data, flags agreement/disagreement (step 8)
+  THEORY   — pure causal reasoning, no data required
+  BACKTEST — data-driven proposals grounded in backtest results
+  HYBRID   — combines both signals; explicitly flags agreement/disagreement
 
 If BACKTEST or HYBRID is requested but the source DAGVersion has no
 backtest_result, the agent falls back to THEORY and explains why.
@@ -27,6 +27,7 @@ from typing import Any
 
 from anthropic import Anthropic
 
+from ..models.backtest_result import BacktestResult
 from ..models.dag_version import DAGVersion, DAGVersionStatus
 from ..models.edge import Edge
 from ..models.modification_proposal import (
@@ -95,6 +96,128 @@ IMPORTANT RULES:
 - If the user rejects a proposal, acknowledge it and propose something different.
 - When you have no more proposals, say so explicitly.
 """
+
+_SYSTEM_PROMPT_BACKTEST = """\
+You are a causal reasoning assistant helping a researcher refine an existing \
+causal hypothesis network (DAG) using empirical backtest results.
+
+You have been given the backtest results showing which proxy nodes added \
+predictive signal and which did not. Your proposals must be grounded in \
+this empirical evidence — not just causal theory.
+
+Propose modifications — one at a time — using this schema:
+
+{
+  "source": "data",
+  "confidence": <float 0.0–1.0>,
+  "rationale": "<explain how the backtest evidence motivates this change>",
+  "proposed_change": {
+    "change_type": "<add_node|remove_node|update_node|add_edge|remove_edge|update_edge>",
+    ... (same field reference as THEORY mode)
+  }
+}
+
+Guidance for data-driven proposals:
+- Nodes with NEGATIVE or ZERO contribution: consider removing them, \
+  reclassifying them, or finding better proxies.
+- Nodes with HIGH contribution: consider promoting their measurability_state \
+  toward Validated, or adding children that might explain the mechanism.
+- Low overall lift: suggest adding new nodes/edges that might capture \
+  unexplained variance in the outcome.
+
+node_type values: Exposure | Outcome | Confounder | Mediator | Collider
+measurability_state values: Hypothetical | Identified | Proxied | Validated
+
+IMPORTANT RULES:
+- Always wrap your proposal in a ```json ... ``` fenced code block.
+- After the JSON block, add a brief natural-language summary citing the data.
+- Never overstate causal claims — this is structured hypothesis generation.
+- Distinguish between "the data shows X" and "we hypothesise X causes Y".
+- If the user rejects a proposal, acknowledge and propose something different.
+- When you have no more data-driven proposals, say so explicitly.
+"""
+
+_SYSTEM_PROMPT_HYBRID = """\
+You are a causal reasoning assistant helping a researcher refine an existing \
+causal hypothesis network (DAG) using both causal theory and empirical backtest results.
+
+You must evaluate each proposed change from BOTH perspectives:
+  1. Does causal theory support it?
+  2. Does the backtest data support it?
+
+Then explicitly flag whether theory and data AGREE or DISAGREE.
+
+Use this schema — note the required theory_data_agreement field:
+
+{
+  "source": "both",
+  "confidence": <float 0.0–1.0>,
+  "rationale": "<explain both the theoretical AND empirical reasoning>",
+  "theory_data_agreement": <true if theory and data point the same direction, \
+false if they conflict>,
+  "proposed_change": {
+    "change_type": "<add_node|remove_node|update_node|add_edge|remove_edge|update_edge>",
+    ... (same field reference as THEORY mode)
+  }
+}
+
+When theory and data AGREE (theory_data_agreement: true):
+- State clearly that both signals point to this change.
+- Express higher confidence.
+
+When theory and data DISAGREE (theory_data_agreement: false):
+- Explain the conflict explicitly: "Theory predicts X, but the data shows Y."
+- Suggest a way to resolve the tension (better proxy, confounding variable, etc.).
+- Express lower confidence and let the user decide.
+
+node_type values: Exposure | Outcome | Confounder | Mediator | Collider
+measurability_state values: Hypothetical | Identified | Proxied | Validated
+
+IMPORTANT RULES:
+- Always wrap your proposal in a ```json ... ``` fenced code block.
+- theory_data_agreement is REQUIRED in every proposal in HYBRID mode.
+- Never suppress a disagreement — surface it, explain it, let the human decide.
+- Never overstate causal claims — this is structured hypothesis generation.
+- If the user rejects a proposal, acknowledge and propose something different.
+"""
+
+# ---------------------------------------------------------------------------
+# Backtest context formatter
+# ---------------------------------------------------------------------------
+
+
+def _format_backtest_context(
+    backtest_result: BacktestResult,
+    version: DAGVersion,
+) -> str:
+    """Produce a human-readable + LLM-readable summary of a BacktestResult."""
+    node_map = {n.id: n.label for n in version.nodes}
+    lines = [
+        "BACKTEST RESULTS:",
+        f"  Baseline score (no proxy features): {backtest_result.baseline_score:.4f}",
+        f"  DAG score (with proxy features):    {backtest_result.dag_score:.4f}",
+        f"  Lift:                               {backtest_result.lift:+.4f}",
+        "",
+        "Per-node contributions (positive = added signal, negative = hurt):",
+    ]
+    if backtest_result.node_contributions:
+        sorted_contribs = sorted(
+            backtest_result.node_contributions.items(),
+            key=lambda x: x[1],
+            reverse=True,
+        )
+        for node_id, contrib in sorted_contribs:
+            label = node_map.get(node_id, node_id[:8])
+            signal = "✓ added signal" if contrib > 0 else "✗ no signal"
+            lines.append(f"  [{node_id[:8]}] {label}: {contrib:+.4f}  ({signal})")
+    else:
+        lines.append("  (no per-node data available)")
+
+    if backtest_result.notes:
+        lines += ["", f"Notes: {backtest_result.notes}"]
+
+    return "\n".join(lines)
+
 
 # ---------------------------------------------------------------------------
 # Helpers: extract JSON proposal from LLM response
@@ -292,8 +415,9 @@ def _trim_history(
 class ModificationAgent:
     """Human-in-the-loop agent for refining an existing DAGVersion.
 
-    Currently supports THEORY mode only. BACKTEST and HYBRID modes are
-    implemented in step 8.
+    Supports THEORY, BACKTEST, and HYBRID modes. BACKTEST and HYBRID require
+    the source DAGVersion to have a backtest_result attached; if not present
+    both modes fall back to THEORY automatically.
 
     Args:
         db: Open Database instance.
@@ -541,12 +665,35 @@ class ModificationAgent:
     # ------------------------------------------------------------------
 
     def _build_opening_messages(self) -> list[dict[str, str]]:
-        dag_context = (
-            f"Here is the causal DAG you will help refine:\n\n{self.dag.summary()}\n\n"
-            "Analyse the structure and propose one improvement. "
-            "Wrap your proposal in a ```json ... ``` block as instructed."
-        )
-        return [{"role": "user", "content": dag_context}]
+        dag_section = f"Here is the causal DAG you will help refine:\n\n{self.dag.summary()}"
+
+        if self.modification_mode in (
+            ModificationMode.Backtest, ModificationMode.Hybrid
+        ) and self.source_version.backtest_result is not None:
+            backtest_section = _format_backtest_context(
+                self.source_version.backtest_result, self.source_version
+            )
+            if self.modification_mode == ModificationMode.Backtest:
+                instruction = (
+                    "Using the backtest results above, propose one data-driven "
+                    "improvement to the DAG. Wrap your proposal in a ```json ... ``` block."
+                )
+            else:  # Hybrid
+                instruction = (
+                    "Using both the DAG structure and the backtest results, propose "
+                    "one improvement. Explicitly state whether theory and data agree. "
+                    "Wrap your proposal in a ```json ... ``` block. "
+                    "Remember: theory_data_agreement is required."
+                )
+            content = f"{dag_section}\n\n{backtest_section}\n\n{instruction}"
+        else:
+            content = (
+                f"{dag_section}\n\n"
+                "Analyse the structure and propose one improvement. "
+                "Wrap your proposal in a ```json ... ``` block as instructed."
+            )
+
+        return [{"role": "user", "content": content}]
 
     def _chat(self, user_message: str) -> str:
         history = _trim_history(list(self.session.conversation_history), self.dag)
@@ -554,10 +701,16 @@ class ModificationAgent:
         return self._call_llm(messages)
 
     def _call_llm(self, messages: list[dict[str, str]]) -> str:
+        system_prompt = {
+            ModificationMode.Theory: _SYSTEM_PROMPT_THEORY,
+            ModificationMode.Backtest: _SYSTEM_PROMPT_BACKTEST,
+            ModificationMode.Hybrid: _SYSTEM_PROMPT_HYBRID,
+        }.get(self.modification_mode, _SYSTEM_PROMPT_THEORY)
+
         response = self.client.messages.create(
             model=MODEL,
             max_tokens=2048,
-            system=_SYSTEM_PROMPT_THEORY,
+            system=system_prompt,
             messages=messages,
         )
         return response.content[0].text

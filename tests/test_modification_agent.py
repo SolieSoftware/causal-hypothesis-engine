@@ -443,3 +443,258 @@ class TestModificationAgentTrimHistory:
         assert len(result) == 21
         assert "CONTEXT SUMMARY" in result[0]["content"]
         assert "Rain" in result[0]["content"]
+
+
+# ---------------------------------------------------------------------------
+# BACKTEST and HYBRID modes
+# ---------------------------------------------------------------------------
+
+
+def _make_backtest_result(version_id: str, node_ids: list[str]) -> "BacktestResult":
+    from causal_hypothesis_engine.models.backtest_result import BacktestResult
+    contributions = {nid: (0.05 if i == 0 else -0.01) for i, nid in enumerate(node_ids)}
+    return BacktestResult(
+        version_id=version_id,
+        adapter_type="Insurance",
+        baseline_score=0.62,
+        dag_score=0.67,
+        lift=0.05,
+        node_contributions=contributions,
+        notes="Rain added signal. Wind did not.",
+    )
+
+
+def _make_tested_version(
+    sample_network: HypothesisNetwork,
+    rain_node: Node,
+    flood_node: Node,
+    rain_flood_edge: Edge,
+) -> DAGVersion:
+    from causal_hypothesis_engine.models.dag_version import DAGVersionStatus
+    version = DAGVersion(
+        network_id=sample_network.id,
+        nodes=[rain_node, flood_node],
+        edges=[rain_flood_edge],
+    )
+    br = _make_backtest_result(version.version_id, [rain_node.id, flood_node.id])
+    return version.model_copy(update={
+        "status": DAGVersionStatus.Tested,
+        "backtest_result": br,
+    })
+
+
+class TestBacktestContext:
+    def test_format_backtest_context_contains_scores(
+        self,
+        base_version: DAGVersion,
+        rain_node: Node,
+        flood_node: Node,
+    ) -> None:
+        from causal_hypothesis_engine.agents.modification_agent import _format_backtest_context
+        br = _make_backtest_result(base_version.version_id, [rain_node.id, flood_node.id])
+        text = _format_backtest_context(br, base_version)
+        assert "0.6200" in text
+        assert "0.6700" in text
+        assert "+0.0500" in text
+
+    def test_format_backtest_context_contains_node_labels(
+        self,
+        base_version: DAGVersion,
+        rain_node: Node,
+        flood_node: Node,
+    ) -> None:
+        from causal_hypothesis_engine.agents.modification_agent import _format_backtest_context
+        br = _make_backtest_result(base_version.version_id, [rain_node.id, flood_node.id])
+        text = _format_backtest_context(br, base_version)
+        assert "Rain" in text
+        assert "Flood" in text
+
+    def test_format_backtest_context_flags_signal(
+        self,
+        base_version: DAGVersion,
+        rain_node: Node,
+        flood_node: Node,
+    ) -> None:
+        from causal_hypothesis_engine.agents.modification_agent import _format_backtest_context
+        br = _make_backtest_result(base_version.version_id, [rain_node.id, flood_node.id])
+        text = _format_backtest_context(br, base_version)
+        assert "added signal" in text
+        assert "no signal" in text
+
+    def test_format_backtest_context_includes_notes(
+        self,
+        base_version: DAGVersion,
+        rain_node: Node,
+        flood_node: Node,
+    ) -> None:
+        from causal_hypothesis_engine.agents.modification_agent import _format_backtest_context
+        br = _make_backtest_result(base_version.version_id, [rain_node.id, flood_node.id])
+        br = br.model_copy(update={"notes": "Special observation."})
+        text = _format_backtest_context(br, base_version)
+        assert "Special observation." in text
+
+    def test_format_backtest_context_no_contributions(
+        self, base_version: DAGVersion
+    ) -> None:
+        from causal_hypothesis_engine.agents.modification_agent import _format_backtest_context
+        from causal_hypothesis_engine.models.backtest_result import BacktestResult
+        br = BacktestResult(
+            version_id=base_version.version_id,
+            adapter_type="Insurance",
+            baseline_score=0.5, dag_score=0.5, lift=0.0,
+        )
+        text = _format_backtest_context(br, base_version)
+        assert "no per-node data available" in text
+
+
+class TestBacktestModeAgent:
+    def test_backtest_mode_stays_when_result_present(
+        self,
+        tmp_db: Database,
+        sample_network: HypothesisNetwork,
+        rain_node: Node,
+        flood_node: Node,
+        rain_flood_edge: Edge,
+        tmp_path: Path,
+    ) -> None:
+        tmp_db.create_network(sample_network)
+        tested = _make_tested_version(sample_network, rain_node, flood_node, rain_flood_edge)
+        tmp_db.save_version(tested)
+        agent = ModificationAgent(
+            db=tmp_db, network=sample_network, source_version=tested,
+            modification_mode=ModificationMode.Backtest,
+            checkpoint_dir=tmp_path,
+        )
+        assert agent.modification_mode == ModificationMode.Backtest
+        assert not agent._fell_back
+
+    def test_backtest_opening_message_contains_backtest_data(
+        self,
+        tmp_db: Database,
+        sample_network: HypothesisNetwork,
+        rain_node: Node,
+        flood_node: Node,
+        rain_flood_edge: Edge,
+        tmp_path: Path,
+    ) -> None:
+        tmp_db.create_network(sample_network)
+        tested = _make_tested_version(sample_network, rain_node, flood_node, rain_flood_edge)
+        tmp_db.save_version(tested)
+        agent = ModificationAgent(
+            db=tmp_db, network=sample_network, source_version=tested,
+            modification_mode=ModificationMode.Backtest,
+            checkpoint_dir=tmp_path,
+        )
+        messages = agent._build_opening_messages()
+        content = messages[0]["content"]
+        assert "BACKTEST RESULTS" in content
+        assert "Baseline score" in content
+
+    def test_hybrid_opening_message_contains_both_dag_and_backtest(
+        self,
+        tmp_db: Database,
+        sample_network: HypothesisNetwork,
+        rain_node: Node,
+        flood_node: Node,
+        rain_flood_edge: Edge,
+        tmp_path: Path,
+    ) -> None:
+        tmp_db.create_network(sample_network)
+        tested = _make_tested_version(sample_network, rain_node, flood_node, rain_flood_edge)
+        tmp_db.save_version(tested)
+        agent = ModificationAgent(
+            db=tmp_db, network=sample_network, source_version=tested,
+            modification_mode=ModificationMode.Hybrid,
+            checkpoint_dir=tmp_path,
+        )
+        messages = agent._build_opening_messages()
+        content = messages[0]["content"]
+        assert "BACKTEST RESULTS" in content
+        assert "NODES:" in content  # DAG summary
+        assert "theory_data_agreement" in content  # HYBRID instruction
+
+    def test_theory_opening_message_has_no_backtest_data(
+        self,
+        tmp_db: Database,
+        sample_network: HypothesisNetwork,
+        base_version: DAGVersion,
+        tmp_path: Path,
+    ) -> None:
+        tmp_db.create_network(sample_network)
+        tmp_db.save_version(base_version)
+        agent = ModificationAgent(
+            db=tmp_db, network=sample_network, source_version=base_version,
+            modification_mode=ModificationMode.Theory,
+            checkpoint_dir=tmp_path,
+        )
+        messages = agent._build_opening_messages()
+        content = messages[0]["content"]
+        assert "BACKTEST RESULTS" not in content
+
+    def test_hybrid_mode_stays_when_result_present(
+        self,
+        tmp_db: Database,
+        sample_network: HypothesisNetwork,
+        rain_node: Node,
+        flood_node: Node,
+        rain_flood_edge: Edge,
+        tmp_path: Path,
+    ) -> None:
+        tmp_db.create_network(sample_network)
+        tested = _make_tested_version(sample_network, rain_node, flood_node, rain_flood_edge)
+        tmp_db.save_version(tested)
+        agent = ModificationAgent(
+            db=tmp_db, network=sample_network, source_version=tested,
+            modification_mode=ModificationMode.Hybrid,
+            checkpoint_dir=tmp_path,
+        )
+        assert agent.modification_mode == ModificationMode.Hybrid
+        assert not agent._fell_back
+
+
+class TestHybridProposalSchema:
+    """HYBRID proposals must carry theory_data_agreement."""
+
+    def test_hybrid_proposal_with_agreement(self) -> None:
+        p = ModificationProposal(
+            source="both",
+            confidence=0.88,
+            rationale="Theory and data both point to adding this confounder.",
+            theory_data_agreement=True,
+            proposed_change=AddNodeChange(label="Humidity", node_type="Confounder"),
+        )
+        assert p.theory_data_agreement is True
+        assert p.source == "both"
+
+    def test_hybrid_proposal_with_disagreement(self) -> None:
+        p = ModificationProposal(
+            source="both",
+            confidence=0.45,
+            rationale="Theory predicts this edge; data shows no signal.",
+            theory_data_agreement=False,
+            proposed_change=AddNodeChange(label="Temperature", node_type="Exposure"),
+        )
+        assert p.theory_data_agreement is False
+
+    def test_hybrid_proposal_roundtrip(self) -> None:
+        p = ModificationProposal(
+            source="both",
+            confidence=0.7,
+            rationale="Mixed signals.",
+            theory_data_agreement=True,
+            proposed_change=AddNodeChange(label="X", node_type="Mediator"),
+        )
+        restored = ModificationProposal.model_validate_json(p.model_dump_json())
+        assert restored.theory_data_agreement is True
+        assert restored.source == "both"
+
+    def test_data_source_proposal_roundtrip(self) -> None:
+        p = ModificationProposal(
+            source="data",
+            confidence=0.82,
+            rationale="Backtest shows this node added 4% lift.",
+            proposed_change=AddNodeChange(label="FloodZone", node_type="Confounder"),
+        )
+        restored = ModificationProposal.model_validate_json(p.model_dump_json())
+        assert restored.source == "data"
+        assert restored.theory_data_agreement is None  # not set in BACKTEST mode
