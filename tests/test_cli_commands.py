@@ -56,7 +56,9 @@ class TestDoctorCommand:
         self, runner: CliRunner, isolated_env: Path
     ) -> None:
         env = dict(os.environ, ANTHROPIC_API_KEY="sk-test-key")
-        result = runner.invoke(cli, ["doctor"], env=env, catch_exceptions=False)
+        # Mock Python version so the check passes on all test environments.
+        with mock.patch("platform.python_version", return_value="3.12.0"):
+            result = runner.invoke(cli, ["doctor"], env=env, catch_exceptions=False)
         assert result.exit_code == 0
         assert "All checks passed" in result.output
 

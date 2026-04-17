@@ -16,6 +16,30 @@ import os
 import sys
 from pathlib import Path
 
+
+def _load_dotenv() -> None:
+    """Load variables from a .env file in the current directory (if present).
+
+    Only sets variables that are not already in the environment, so an
+    explicitly exported value always takes precedence.
+    """
+    env_path = Path.cwd() / ".env"
+    if not env_path.is_file():
+        return
+    with open(env_path) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+
+
+_load_dotenv()
+
 import click
 from rich.console import Console
 from rich.table import Table
