@@ -326,3 +326,160 @@ class TestDAGAgentCheckpoint:
         assert len(loaded_version.nodes) == 2
         labels = {n.label for n in loaded_version.nodes}
         assert labels == {"Rain", "Flood"}
+
+
+# ---------------------------------------------------------------------------
+# DAGAgent: _execute_tool — tool-use dispatch
+# ---------------------------------------------------------------------------
+
+
+class _NullConsole:
+    """Swallow all Rich output in tests."""
+    def print(self, *a, **kw) -> None:
+        pass
+
+
+class TestExecuteTool:
+    @pytest.fixture
+    def agent(
+        self, tmp_db: Database, sample_network: HypothesisNetwork, tmp_path: Path
+    ) -> DAGAgent:
+        tmp_db.create_network(sample_network)
+        return DAGAgent(db=tmp_db, network=sample_network, checkpoint_dir=tmp_path)
+
+    def test_add_node_tool_adds_to_draft(self, agent: DAGAgent) -> None:
+        result = agent._execute_tool(
+            "add_node",
+            {"label": "Rainfall", "node_type": "Exposure", "measurability_state": "Hypothetical"},
+            _NullConsole(),
+        )
+        assert "Rainfall" in result
+        assert len(agent.draft.nodes) == 1
+        assert agent.draft.nodes[0].label == "Rainfall"
+
+    def test_add_node_tool_with_description(self, agent: DAGAgent) -> None:
+        agent._execute_tool(
+            "add_node",
+            {
+                "label": "Flood Risk",
+                "node_type": "Outcome",
+                "measurability_state": "Hypothetical",
+                "description": "Probability of a flood event",
+            },
+            _NullConsole(),
+        )
+        node = agent.draft.find_node_by_label("Flood Risk")
+        assert node is not None
+        assert node.description == "Probability of a flood event"
+
+    def test_add_node_duplicate_skipped(self, agent: DAGAgent) -> None:
+        agent._execute_tool(
+            "add_node",
+            {"label": "Rain", "node_type": "Exposure", "measurability_state": "Hypothetical"},
+            _NullConsole(),
+        )
+        result = agent._execute_tool(
+            "add_node",
+            {"label": "Rain", "node_type": "Exposure", "measurability_state": "Identified"},
+            _NullConsole(),
+        )
+        assert "already exists" in result
+        assert len(agent.draft.nodes) == 1
+
+    def test_add_edge_tool_adds_to_draft(self, agent: DAGAgent) -> None:
+        agent._execute_tool(
+            "add_node",
+            {"label": "Rain", "node_type": "Exposure", "measurability_state": "Hypothetical"},
+            _NullConsole(),
+        )
+        agent._execute_tool(
+            "add_node",
+            {"label": "Flood", "node_type": "Outcome", "measurability_state": "Hypothetical"},
+            _NullConsole(),
+        )
+        result = agent._execute_tool(
+            "add_edge",
+            {"source_label": "Rain", "target_label": "Flood", "label": "causes"},
+            _NullConsole(),
+        )
+        assert "causes" in result
+        assert len(agent.draft.edges) == 1
+
+    def test_add_edge_missing_source_returns_error(self, agent: DAGAgent) -> None:
+        agent._execute_tool(
+            "add_node",
+            {"label": "Flood", "node_type": "Outcome", "measurability_state": "Hypothetical"},
+            _NullConsole(),
+        )
+        result = agent._execute_tool(
+            "add_edge",
+            {"source_label": "Missing", "target_label": "Flood", "label": "causes"},
+            _NullConsole(),
+        )
+        assert "Error" in result
+        assert len(agent.draft.edges) == 0
+
+    def test_remove_node_tool(self, agent: DAGAgent) -> None:
+        agent._execute_tool(
+            "add_node",
+            {"label": "Rain", "node_type": "Exposure", "measurability_state": "Hypothetical"},
+            _NullConsole(),
+        )
+        result = agent._execute_tool(
+            "remove_node", {"label": "Rain"}, _NullConsole()
+        )
+        assert "Removed" in result
+        assert len(agent.draft.nodes) == 0
+
+    def test_remove_node_not_found(self, agent: DAGAgent) -> None:
+        result = agent._execute_tool(
+            "remove_node", {"label": "Ghost"}, _NullConsole()
+        )
+        assert "not found" in result
+
+    def test_remove_edge_tool(self, agent: DAGAgent) -> None:
+        agent._execute_tool(
+            "add_node",
+            {"label": "Rain", "node_type": "Exposure", "measurability_state": "Hypothetical"},
+            _NullConsole(),
+        )
+        agent._execute_tool(
+            "add_node",
+            {"label": "Flood", "node_type": "Outcome", "measurability_state": "Hypothetical"},
+            _NullConsole(),
+        )
+        agent._execute_tool(
+            "add_edge",
+            {"source_label": "Rain", "target_label": "Flood", "label": "causes"},
+            _NullConsole(),
+        )
+        assert len(agent.draft.edges) == 1
+        result = agent._execute_tool(
+            "remove_edge",
+            {"source_label": "Rain", "target_label": "Flood"},
+            _NullConsole(),
+        )
+        assert "Removed" in result
+        assert len(agent.draft.edges) == 0
+
+    def test_remove_edge_not_found(self, agent: DAGAgent) -> None:
+        agent._execute_tool(
+            "add_node",
+            {"label": "Rain", "node_type": "Exposure", "measurability_state": "Hypothetical"},
+            _NullConsole(),
+        )
+        agent._execute_tool(
+            "add_node",
+            {"label": "Flood", "node_type": "Outcome", "measurability_state": "Hypothetical"},
+            _NullConsole(),
+        )
+        result = agent._execute_tool(
+            "remove_edge",
+            {"source_label": "Rain", "target_label": "Flood"},
+            _NullConsole(),
+        )
+        assert "No edge found" in result
+
+    def test_unknown_tool_returns_error(self, agent: DAGAgent) -> None:
+        result = agent._execute_tool("nonexistent_tool", {}, _NullConsole())
+        assert "Unknown tool" in result

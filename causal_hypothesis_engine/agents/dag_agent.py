@@ -66,22 +66,96 @@ identification.
 - When the user pushes back, update your proposal rather than defending it dogmatically.
 - Keep the DAG coherent: every added node should connect to the existing graph unless \
 explicitly starting a new subgraph.
+- USE THE TOOLS to add nodes and edges as you discuss them. Do not just describe them \
+in prose — call add_node and add_edge so the DAG is built incrementally.
+- After calling tools, briefly explain your reasoning to the user.
+- Propose one or two additions per turn. Let the user steer.
 
 COMMANDS the user may type:
   /confirm       — you will summarise the full DAG and ask for final save confirmation
   /show          — display the current DAG state (nodes and edges)
   /help          — list available commands
-
-When presenting the DAG state, use this format:
-  NODES:
-    [id_short] Label (NodeType, MeasurabilityState)
-      - Description (if set)
-  EDGES:
-    [src_short] → [tgt_short]  "edge label"  — rationale
-
-Keep responses concise. Propose one or two additions per turn; don't dump a full DAG \
-in one message. Let the user steer.
 """
+
+# ---------------------------------------------------------------------------
+# Tool definitions for Anthropic tool use API
+# ---------------------------------------------------------------------------
+
+_TOOLS = [
+    {
+        "name": "add_node",
+        "description": (
+            "Add a node (variable) to the causal DAG. Call this whenever you and the user "
+            "agree to include a new variable."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "label": {"type": "string", "description": "Short variable name, e.g. 'Rainfall'"},
+                "node_type": {
+                    "type": "string",
+                    "enum": ["Exposure", "Outcome", "Confounder", "Mediator", "Collider"],
+                },
+                "measurability_state": {
+                    "type": "string",
+                    "enum": ["Hypothetical", "Identified", "Proxied", "Validated"],
+                    "description": "How measurable this variable is right now.",
+                },
+                "description": {
+                    "type": "string",
+                    "description": "One-sentence description of the variable (optional).",
+                },
+            },
+            "required": ["label", "node_type", "measurability_state"],
+        },
+    },
+    {
+        "name": "add_edge",
+        "description": (
+            "Add a directed causal edge between two existing nodes. "
+            "Both source and target must already exist in the DAG."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "source_label": {"type": "string", "description": "Label of the cause node."},
+                "target_label": {"type": "string", "description": "Label of the effect node."},
+                "label": {
+                    "type": "string",
+                    "description": "Short description of the causal relationship, e.g. 'causes', 'amplifies'.",
+                },
+                "description": {
+                    "type": "string",
+                    "description": "Optional longer rationale for the edge.",
+                },
+            },
+            "required": ["source_label", "target_label", "label"],
+        },
+    },
+    {
+        "name": "remove_node",
+        "description": "Remove a node (and its connected edges) from the DAG.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "label": {"type": "string", "description": "Label of the node to remove."},
+            },
+            "required": ["label"],
+        },
+    },
+    {
+        "name": "remove_edge",
+        "description": "Remove a directed edge between two nodes.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "source_label": {"type": "string"},
+                "target_label": {"type": "string"},
+            },
+            "required": ["source_label", "target_label"],
+        },
+    },
+]
 
 # ---------------------------------------------------------------------------
 # DraftState — mutable in-memory DAG being built
@@ -301,12 +375,13 @@ class DAGAgent:
                         "outcome or exposure I want to understand."
                     ),
                 }
-            ])
+            ], console)
             self._record_exchange(
                 {"role": "user", "content": f"[Starting session for network: {self.network.name}]"},
                 {"role": "assistant", "content": intro},
             )
-            console.print(Markdown(intro))
+            if intro:
+                console.print(Markdown(intro))
 
         while True:
             try:
@@ -338,12 +413,13 @@ class DAGAgent:
                 continue
 
             # Normal conversational exchange.
-            assistant_reply = self._chat(user_input)
+            assistant_reply = self._chat(user_input, console)
             self._record_exchange(
                 {"role": "user", "content": user_input},
                 {"role": "assistant", "content": assistant_reply},
             )
-            console.print(Markdown(assistant_reply))
+            if assistant_reply:
+                console.print(Markdown(assistant_reply))
 
             # Checkpoint every N exchanges.
             if self.session.exchange_count % CHECKPOINT_EVERY == 0:
@@ -375,11 +451,12 @@ class DAGAgent:
             "rationale, and any open questions or caveats. "
             "End with: 'Ready to save this as a Draft DAGVersion?'"
         )
-        summary = self._chat(summary_prompt)
-        console.print(Markdown(summary))
+        summary = self._chat(summary_prompt, console)
+        if summary:
+            console.print(Markdown(summary))
         self._record_exchange(
             {"role": "user", "content": "[/confirm triggered]"},
-            {"role": "assistant", "content": summary},
+            {"role": "assistant", "content": summary or ""},
         )
 
         confirmed = Confirm.ask("\n[bold]Save this as a Draft DAGVersion?[/bold]")
@@ -420,22 +497,170 @@ class DAGAgent:
     # LLM interaction
     # ------------------------------------------------------------------
 
-    def _chat(self, user_message: str) -> str:
-        """Send user_message in context and return the assistant reply."""
+    def _chat(self, user_message: str, console: Any) -> str:
+        """Send user_message in context, handle tool calls, return final text reply."""
         history = _trim_history(
             list(self.session.conversation_history), self.draft
         )
         messages = history + [{"role": "user", "content": user_message}]
-        return self._call_llm(messages)
+        return self._call_llm(messages, console)
 
-    def _call_llm(self, messages: list[dict[str, str]]) -> str:
-        response = self.client.messages.create(
-            model=MODEL,
-            max_tokens=2048,
-            system=_SYSTEM_PROMPT,
-            messages=messages,
-        )
-        return response.content[0].text
+    def _call_llm(self, messages: list[dict], console: Any) -> str:
+        """Call the API with tool use, executing any tool calls against DraftState.
+
+        Returns the final plain-text reply (may be empty string if the model
+        only called tools and produced no prose).
+        """
+        from rich.panel import Panel
+
+        while True:
+            response = self.client.messages.create(
+                model=MODEL,
+                max_tokens=2048,
+                system=_SYSTEM_PROMPT,
+                tools=_TOOLS,
+                messages=messages,
+            )
+
+            # Collect text and tool-use blocks from the response.
+            text_parts: list[str] = []
+            tool_uses: list[Any] = []
+
+            for block in response.content:
+                if block.type == "text":
+                    text_parts.append(block.text)
+                elif block.type == "tool_use":
+                    tool_uses.append(block)
+
+            # If no tool calls, return whatever text the model produced.
+            if not tool_uses:
+                return "\n".join(text_parts).strip()
+
+            # Print any prose that came alongside the tool calls.
+            if text_parts:
+                from rich.markdown import Markdown
+                console.print(Markdown("\n".join(text_parts)))
+
+            # Execute each tool call and collect results.
+            tool_results = []
+            for tu in tool_uses:
+                result_text = self._execute_tool(tu.name, tu.input, console)
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": tu.id,
+                    "content": result_text,
+                })
+
+            # Append the assistant turn (with tool_use blocks) and tool results,
+            # then loop to get the model's follow-up prose.
+            messages = messages + [
+                {"role": "assistant", "content": response.content},
+                {"role": "user", "content": tool_results},
+            ]
+
+    def _execute_tool(self, name: str, args: dict, console: Any) -> str:
+        """Dispatch a tool call to DraftState and return a result string."""
+        from rich.panel import Panel
+
+        if name == "add_node":
+            label = args["label"]
+            node_type = NodeType(args["node_type"])
+            measurability = MeasurabilityState(args["measurability_state"])
+            description = args.get("description", "")
+
+            # Avoid duplicates by label.
+            if self.draft.find_node_by_label(label):
+                return f"Node '{label}' already exists — skipped."
+
+            node = Node(
+                label=label,
+                node_type=node_type,
+                measurability_state=measurability,
+                description=description,
+            )
+            self.draft.add_node(node)
+            console.print(
+                Panel(
+                    f"[green]+[/green] [bold]{label}[/bold]  "
+                    f"[dim]{node_type.value} · {measurability.value}[/dim]"
+                    + (f"\n  {description}" if description else ""),
+                    title="[green]Node added[/green]",
+                    expand=False,
+                )
+            )
+            return f"Added node '{label}' ({node_type.value}, {measurability.value})."
+
+        if name == "add_edge":
+            src_label = args["source_label"]
+            tgt_label = args["target_label"]
+            edge_label = args["label"]
+            description = args.get("description", "")
+
+            src = self.draft.find_node_by_label(src_label)
+            tgt = self.draft.find_node_by_label(tgt_label)
+            if src is None:
+                return f"Error: source node '{src_label}' not found. Add it first."
+            if tgt is None:
+                return f"Error: target node '{tgt_label}' not found. Add it first."
+
+            edge = Edge(
+                source_node_id=src.id,
+                target_node_id=tgt.id,
+                label=edge_label,
+                description=description,
+            )
+            self.draft.add_edge(edge)
+            console.print(
+                Panel(
+                    f"[green]+[/green] [bold]{src_label}[/bold] → [bold]{tgt_label}[/bold]  "
+                    f"[dim]\"{edge_label}\"[/dim]",
+                    title="[green]Edge added[/green]",
+                    expand=False,
+                )
+            )
+            return f"Added edge '{src_label}' → '{tgt_label}' ({edge_label})."
+
+        if name == "remove_node":
+            label = args["label"]
+            node = self.draft.find_node_by_label(label)
+            if node is None:
+                return f"Node '{label}' not found."
+            self.draft.remove_node(node.id)
+            console.print(
+                Panel(
+                    f"[red]-[/red] [bold]{label}[/bold] removed (and connected edges).",
+                    title="[red]Node removed[/red]",
+                    expand=False,
+                )
+            )
+            return f"Removed node '{label}' and its connected edges."
+
+        if name == "remove_edge":
+            src_label = args["source_label"]
+            tgt_label = args["target_label"]
+            src = self.draft.find_node_by_label(src_label)
+            tgt = self.draft.find_node_by_label(tgt_label)
+            if src is None or tgt is None:
+                return "Error: one or both nodes not found."
+            # Find the edge by source/target ids.
+            edge = next(
+                (e for e in self.draft.edges
+                 if e.source_node_id == src.id and e.target_node_id == tgt.id),
+                None,
+            )
+            if edge is None:
+                return f"No edge found from '{src_label}' to '{tgt_label}'."
+            self.draft.remove_edge(edge.id)
+            console.print(
+                Panel(
+                    f"[red]-[/red] [bold]{src_label}[/bold] → [bold]{tgt_label}[/bold] removed.",
+                    title="[red]Edge removed[/red]",
+                    expand=False,
+                )
+            )
+            return f"Removed edge '{src_label}' → '{tgt_label}'."
+
+        return f"Unknown tool: {name}"
 
     # ------------------------------------------------------------------
     # Conversation history
