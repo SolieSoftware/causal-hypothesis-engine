@@ -368,6 +368,95 @@ def backtest(version_id: str, data: str) -> None:
 
 
 @cli.command()
+@click.argument("version_id")
+@click.option(
+    "--format", "-f", "fmt",
+    type=click.Choice(["mermaid", "dot", "json"], case_sensitive=False),
+    default="mermaid",
+    show_default=True,
+    help="Output format.",
+)
+@click.option(
+    "--out", "-o",
+    default=None,
+    type=click.Path(),
+    help="Write output to a file instead of stdout.",
+)
+def export(version_id: str, fmt: str, out: str | None) -> None:
+    """Export a DAGVersion to Mermaid, DOT, or JSON."""
+    db = _get_db()
+    version = db.get_version(version_id)
+    if version is None:
+        console.print(
+            f"[bold red][ERROR][/bold red] Problem: Version [bold]{version_id}[/bold] not found.\n"
+            "  Fix: Run [bold]causal-engine list[/bold] to see available version IDs."
+        )
+        sys.exit(1)
+
+    from .export import to_dot, to_json, to_mermaid
+    fmt_lower = fmt.lower()
+    if fmt_lower == "mermaid":
+        output = to_mermaid(version)
+    elif fmt_lower == "dot":
+        output = to_dot(version)
+    else:
+        output = to_json(version)
+
+    if out:
+        Path(out).write_text(output)
+        console.print(f"[green]✓[/green] Written to [bold]{out}[/bold]")
+    else:
+        print(output)
+
+
+@cli.command()
+@click.argument("version_id")
+@click.option(
+    "--out", "-o",
+    default=None,
+    type=click.Path(),
+    help="Save HTML to this path (default: temp file).",
+)
+@click.option("--no-open", is_flag=True, default=False,
+              help="Write the file but do not open the browser.")
+def view(version_id: str, out: str | None, no_open: bool) -> None:
+    """Open an interactive 3D graph of a DAGVersion in the browser."""
+    import tempfile
+    import webbrowser
+
+    db = _get_db()
+    version = db.get_version(version_id)
+    if version is None:
+        console.print(
+            f"[bold red][ERROR][/bold red] Problem: Version [bold]{version_id}[/bold] not found.\n"
+            "  Fix: Run [bold]causal-engine list[/bold] to see available version IDs."
+        )
+        sys.exit(1)
+
+    from .export import to_html_3d
+    html = to_html_3d(version)
+
+    if out:
+        html_path = Path(out)
+    else:
+        tmp = tempfile.NamedTemporaryFile(
+            suffix=".html",
+            prefix=f"causal_dag_{version_id[:8]}_",
+            delete=False,
+        )
+        tmp.write(html.encode())
+        tmp.close()
+        html_path = Path(tmp.name)
+
+    html_path.write_text(html)
+    console.print(f"[green]✓[/green] Viewer written to [bold]{html_path}[/bold]")
+
+    if not no_open:
+        webbrowser.open(f"file://{html_path.resolve()}")
+        console.print("[dim]Opening in browser...[/dim]")
+
+
+@cli.command()
 @click.argument("version_id_1")
 @click.argument("version_id_2")
 def compare(version_id_1: str, version_id_2: str) -> None:
@@ -395,9 +484,76 @@ def compare(version_id_1: str, version_id_2: str) -> None:
 
 
 @cli.command()
+@click.argument("version_id")
+@click.option(
+    "--manifest", "-m",
+    required=True,
+    type=click.Path(exists=True, dir_okay=False),
+    help="Path to the YAML manifest file.",
+)
+@click.option(
+    "--out", "-o",
+    default=None,
+    type=click.Path(),
+    help="Output Parquet path (default: ~/.causal_engine/datasets/...).",
+)
+@click.option("--strict", is_flag=True, default=False,
+              help="Treat label mismatches as errors.")
+def dataset(version_id: str, manifest: str, out: str | None, strict: bool) -> None:
+    """Fetch financial data from a manifest and build a Parquet dataset."""
+    db = _get_db()
+
+    version = db.get_version(version_id)
+    if version is None:
+        console.print(
+            f"[bold red][ERROR][/bold red] Problem: Version [bold]{version_id}[/bold] not found.\n"
+            "  Fix: Run [bold]causal-engine list[/bold] to see available version IDs."
+        )
+        sys.exit(1)
+
+    try:
+        from .dataset_builder import DatasetBuilder
+        builder = DatasetBuilder()
+        result = builder.run(
+            version=version,
+            manifest_path=manifest,
+            out_path=out,
+            strict=strict,
+        )
+    except (FileNotFoundError, ValueError, RuntimeError) as exc:
+        console.print(f"[bold red][ERROR][/bold red] {exc}")
+        sys.exit(1)
+
+    for w in result.warnings:
+        console.print(f"[yellow]{w}[/yellow]")
+
+    t = Table(title="ADF Results", show_lines=True)
+    t.add_column("Node", style="bold")
+    t.add_column("Transform Applied")
+    t.add_column("ADF Statistic", justify="right")
+    t.add_column("p-value", justify="right")
+    t.add_column("Stationary", justify="center")
+
+    for label, adf in result.adf_results.items():
+        stat = f"{adf['statistic']:.4f}" if adf.get("statistic") is not None else "—"
+        pval = f"{adf['pvalue']:.4f}" if adf.get("pvalue") is not None else "—"
+        passed = "[green]✓[/green]" if adf.get("passed") else "[red]✗[/red]"
+        t.add_row(label, adf.get("transform_applied", "—"), stat, pval, passed)
+
+    console.print(t)
+    console.print(
+        f"\n[green]✓[/green] Dataset written to: [bold]{result.output_path}[/bold]\n"
+        f"  Columns ({len(result.columns)}): {', '.join(result.columns)}\n"
+        f"  Date range: {result.start_date} → {result.end_date}  [{result.frequency}]"
+    )
+
+
+@cli.command()
 @click.option("--bigquery", is_flag=True, default=False,
               help="Also check BigQuery credentials (optional).")
-def doctor(bigquery: bool) -> None:
+@click.option("--financial", is_flag=True, default=False,
+              help="Also check financial adapter packages and FRED_API_KEY.")
+def doctor(bigquery: bool, financial: bool) -> None:
     """Check the environment (API key, SQLite, Python version, optional BigQuery)."""
     import platform
     import sqlite3
@@ -480,6 +636,27 @@ def doctor(bigquery: bool) -> None:
         except ImportError:
             _warn("BigQuery client",
                   "not installed — pip install 'causal-hypothesis-engine[bigquery]'")
+
+    # -- Financial adapter (optional)
+    if financial:
+        if os.environ.get("FRED_API_KEY"):
+            _ok("FRED_API_KEY", "set")
+        else:
+            _warn("FRED_API_KEY",
+                  "not set — required for financial adapter: export FRED_API_KEY=...")
+        for pkg, import_name in [
+            ("fredapi", "fredapi"),
+            ("yfinance", "yfinance"),
+            ("pyyaml", "yaml"),
+            ("requests", "requests"),
+            ("statsmodels", "statsmodels"),
+        ]:
+            try:
+                ver = importlib.metadata.version(pkg)
+                _ok(f"package: {pkg}", ver)
+            except importlib.metadata.PackageNotFoundError:
+                _warn(f"package: {pkg}",
+                      "not installed — pip install 'causal-hypothesis-engine[financial]'")
 
     # -- Render table
     t = Table(title="Environment Check", show_lines=False, box=None)

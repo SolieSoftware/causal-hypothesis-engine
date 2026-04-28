@@ -21,6 +21,13 @@ dependencies = [
 bigquery = [
     "google-cloud-bigquery>=3.0",
 ]
+financial = [
+    "fredapi>=0.5",
+    "yfinance>=0.2",
+    "pyyaml>=6.0",
+    "requests>=2.31",
+    "statsmodels>=0.14",
+]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",

@@ -84,8 +84,10 @@ causal-engine resume [SESSION_ID] [--last]   Resume an interrupted session
 causal-engine list                           List all networks and versions
 causal-engine modify <version-id>            Start a ModificationAgent session
 causal-engine backtest <version-id>          Run BacktestAgent on a version
+causal-engine dataset <version-id>           Fetch financial data and build a Parquet dataset
 causal-engine compare <v-id-1> <v-id-2>      Diff two DAGVersions
 causal-engine doctor [--bigquery]            Check environment
+causal-engine doctor --financial             Check environment + financial adapter packages
 causal-engine demo                           Canned demo (no API key needed)
 ```
 
@@ -104,6 +106,63 @@ Three modes:
 - **theory** — pure causal reasoning, no data required
 - **backtest** — proposals driven by backtest results (requires a Tested version)
 - **hybrid** — combines both signals, explicitly flags where theory and data agree or disagree
+
+---
+
+## Financial Data + DatasetBuilder
+
+Build a feature matrix from real financial data by writing a YAML manifest that maps DAG nodes to data sources.
+
+**Install the financial extras:**
+
+```bash
+pip install -e ".[financial]"
+export FRED_API_KEY=your-key
+```
+
+**Write a manifest** (`fed_market.yaml`):
+
+```yaml
+adapter: financial
+frequency: weekly
+resample_method: last
+start_date: "2014-01-01"
+end_date: "2024-12-31"
+
+nodes:
+  - label: "Fed Funds Rate"
+    source: fred
+    series_id: "DFF"
+    transform: diff
+
+  - label: "S&P 500"
+    source: yahoo
+    ticker: "^GSPC"
+    transform: log_return
+
+  - label: "Custom Signal"
+    source: file
+    path: "./data/my_signal.csv"
+    date_column: "date"
+    value_column: "signal"
+    transform: none
+```
+
+Supported sources: `fred` (FRED API), `yahoo` (Yahoo Finance), `file` (local CSV/Parquet), `url_csv` (direct HTTP CSV).
+
+**Run it:**
+
+```bash
+causal-engine dataset <version-id> --manifest fed_market.yaml
+```
+
+This fetches all series, resamples to the target frequency, applies declared transforms, runs ADF stationarity tests (with automatic extra diff if non-stationary), and writes a Parquet file to `~/.causal_engine/datasets/`. Results print as a Rich table with stationarity status per node.
+
+```bash
+causal-engine dataset <version-id> --manifest fed_market.yaml --out ./data/features.parquet --strict
+```
+
+`--strict` turns label mismatches into errors instead of warnings.
 
 ---
 
@@ -174,6 +233,7 @@ causal_hypothesis_engine/
   adapters/
     base.py               # AdapterBase abstract class
     insurance.py          # InsuranceClaimsAdapter (CSV/Parquet)
+    financial.py          # FinancialDataAdapter (FRED / Yahoo / file / url_csv)
   models/
     node.py               # Node with typed adapter mixin
     edge.py
@@ -182,6 +242,8 @@ causal_hypothesis_engine/
     network.py
     backtest_result.py
     modification_proposal.py
+    dataset_result.py     # ADF results + Parquet output metadata
+  dataset_builder.py      # Deterministic fetch → transform → ADF → Parquet pipeline
   persistence/
     db.py                 # SQLite layer, migrations, schema_version
     checkpoint.py         # Atomic checkpoint writer
@@ -195,6 +257,7 @@ causal_hypothesis_engine/
 
 - Export to DOT / Mermaid / JSON (`causal-engine export`)
 - BigQuery integration for the Insurance adapter
+- BacktestAgent integration for FinancialDataAdapter (v2)
 - MCP server mode for Claude Code integration
-- FinancialEventsAdapter, ClinicalAdapter
+- ClinicalAdapter
 - REST API and web visualisation
