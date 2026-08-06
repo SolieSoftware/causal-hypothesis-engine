@@ -17,11 +17,27 @@ import sys
 from pathlib import Path
 
 
+# Only these keys may be set from a .env file. The loader reads whatever
+# directory the user happens to be in, so without an allowlist a cloned repo
+# containing `.env` with ANTHROPIC_BASE_URL=https://attacker.example would
+# silently redirect every agent call — carrying the API key in the auth header.
+# HTTP_PROXY and SSL_CERT_FILE are equally dangerous.
+_DOTENV_ALLOWED_KEYS = frozenset(
+    {
+        "ANTHROPIC_API_KEY",
+        "FRED_API_KEY",
+        "CAUSAL_ENGINE_HOME",
+        "CAUSAL_ENGINE_MODEL",
+    }
+)
+
+
 def _load_dotenv() -> None:
-    """Load variables from a .env file in the current directory (if present).
+    """Load allowlisted variables from a .env file in the current directory.
 
     Only sets variables that are not already in the environment, so an
-    explicitly exported value always takes precedence.
+    explicitly exported value always takes precedence. Keys outside
+    :data:`_DOTENV_ALLOWED_KEYS` are ignored.
     """
     env_path = Path.cwd() / ".env"
     if not env_path.is_file():
@@ -33,8 +49,10 @@ def _load_dotenv() -> None:
                 continue
             key, _, value = line.partition("=")
             key = key.strip()
+            if key.startswith("export "):
+                key = key[len("export ") :].strip()
             value = value.strip().strip('"').strip("'")
-            if key and key not in os.environ:
+            if key in _DOTENV_ALLOWED_KEYS and key not in os.environ:
                 os.environ[key] = value
 
 
@@ -42,6 +60,8 @@ _load_dotenv()
 
 import click
 from rich.console import Console
+from rich.markup import escape
+from rich.panel import Panel
 from rich.table import Table
 
 from .agents.backtest_agent import BacktestAgent, BacktestPreflightError, check_can_backtest
@@ -409,6 +429,309 @@ def export(version_id: str, fmt: str, out: str | None) -> None:
         print(output)
 
 
+def _load_version_or_exit(db: Database, version_id: str):
+    """Resolve a version id, or exit(1) with the standard error format."""
+    version = db.get_version(version_id)
+    if version is None:
+        console.print(
+            f"[bold red][ERROR][/bold red] Problem: Version [bold]{version_id}[/bold] "
+            "not found.\n"
+            "  Fix: Run [bold]causal-engine list[/bold] to see available version IDs."
+        )
+        sys.exit(1)
+    return version
+
+
+def _read_table_or_exit(path: str):
+    """Load a CSV or Parquet file, or exit(1) with the standard error format."""
+    import pandas as pd
+
+    file_path = Path(path)
+    try:
+        if file_path.suffix.lower() in {".parquet", ".pq"}:
+            return pd.read_parquet(file_path)
+        return pd.read_csv(file_path)
+    except Exception as exc:
+        console.print(
+            f"[bold red][ERROR][/bold red] Problem: Could not read [bold]{path}[/bold].\n"
+            f"  Cause: {exc}\n"
+            "  Fix: Supply a readable .csv or .parquet file."
+        )
+        sys.exit(1)
+
+
+@cli.command()
+@click.argument("version_id")
+@click.option("--node", "-n", required=True, help="Node label to bind (exact match).")
+@click.option(
+    "--column", "-c", "columns", required=True, multiple=True,
+    help="Data column serving as a proxy. Repeat for multiple columns.",
+)
+@click.option(
+    "--data", "-d", default=None, type=click.Path(exists=True, dir_okay=False),
+    help="Optional data file to validate the column names against.",
+)
+@click.option(
+    "--state", type=click.Choice(["Proxied", "Validated"]), default="Proxied",
+    help="Measurability state to set (default: Proxied).",
+)
+def bind(
+    version_id: str,
+    node: str,
+    columns: tuple[str, ...],
+    data: str | None,
+    state: str,
+) -> None:
+    """Bind a DAG node to the data column(s) that measure it.
+
+    This is what makes a version backtestable. Scoring requires a node in
+    state Proxied with proxy_variables set, and previously nothing outside the
+    `demo` command could set that — so a DAG built through the normal workflow
+    could never be evaluated.
+
+    Binding a Tested version is refused: those are immutable.
+    """
+    from .models.node import MeasurabilityState
+
+    db = _get_db()
+    version = _load_version_or_exit(db, version_id)
+
+    if version.is_immutable:
+        console.print(
+            f"[bold red][ERROR][/bold red] Problem: Version {version_id[:8]} is "
+            f"{version.status.value} and cannot be modified.\n"
+            "  Cause: Tested/Archived versions are immutable.\n"
+            "  Fix: Bind columns on a Draft version, or create a new one with "
+            "[bold]causal-engine modify[/bold]."
+        )
+        sys.exit(1)
+
+    target = next((n for n in version.nodes if n.label == node), None)
+    if target is None:
+        available = ", ".join(repr(n.label) for n in version.nodes) or "(none)"
+        console.print(
+            f"[bold red][ERROR][/bold red] Problem: No node labelled "
+            f"[bold]{node}[/bold] in this version.\n"
+            f"  Cause: Label matching is exact and case-sensitive.\n"
+            f"  Fix: Use one of: {available}"
+        )
+        sys.exit(1)
+
+    if data:
+        df = _read_table_or_exit(data)
+        missing = [c for c in columns if c not in df.columns]
+        if missing:
+            console.print(
+                f"[bold red][ERROR][/bold red] Problem: Column(s) not in "
+                f"[bold]{data}[/bold]: {missing}\n"
+                f"  Fix: Available columns are: {list(df.columns)}"
+            )
+            sys.exit(1)
+
+    metadata = dict(target.adapter_metadata or {})
+    metadata["proxy_variables"] = list(columns)
+    target.adapter_metadata = metadata
+    target.measurability_state = MeasurabilityState(state)
+
+    db.save_version(version)
+    console.print(
+        f"[green]✓[/green] Bound [bold]{node}[/bold] → "
+        f"{', '.join(columns)}  [{state}]"
+    )
+    console.print(
+        f"\n[dim]Next:[/dim] causal-engine backtest [yellow]{version_id}[/yellow] "
+        "--data <file>"
+    )
+
+
+@cli.command()
+@click.argument("data_file", type=click.Path(exists=True, dir_okay=False))
+@click.option(
+    "--version", "-v", "version_id", default=None,
+    help="Optional DAGVersion id — restricts the view to bound columns.",
+)
+@click.option("--max-rows", default=40, help="Maximum columns to list (default: 40).")
+def explore(data_file: str, version_id: str | None, max_rows: int) -> None:
+    """Profile a dataset: shape, missingness, distributions, correlations.
+
+    The engine could previously fetch and transform data but showed you nothing
+    about it beyond a stationarity table — the documented workflow told you to
+    open Python and call df.describe() yourself.
+    """
+    from .analysis import profile_dataset
+
+    df = _read_table_or_exit(data_file)
+
+    if version_id:
+        db = _get_db()
+        version = _load_version_or_exit(db, version_id)
+        wanted: set[str] = set()
+        for node in version.nodes:
+            if node.label in df.columns:
+                wanted.add(node.label)
+            for proxy in (node.adapter_metadata or {}).get("proxy_variables", []):
+                if proxy in df.columns:
+                    wanted.add(proxy)
+        if wanted:
+            df = df[sorted(wanted)]
+        else:
+            console.print(
+                "[yellow][WARN][/yellow] No column in this file matches a node "
+                "label or bound proxy in that version — profiling all columns."
+            )
+
+    profile = profile_dataset(df)
+
+    console.print(
+        Panel(
+            f"[bold cyan]{Path(data_file).name}[/bold cyan]\n\n"
+            f"Rows:            [bold]{profile.n_rows:,}[/bold]\n"
+            f"Columns:         [bold]{profile.n_columns}[/bold]\n"
+            f"Complete rows:   [bold]{profile.n_complete_rows:,}[/bold] "
+            f"({profile.pct_complete_rows:.1f}%)",
+            title="Dataset Profile",
+        )
+    )
+
+    table = Table(title="Columns")
+    table.add_column("Column", style="cyan")
+    table.add_column("Type", style="dim")
+    table.add_column("Missing", justify="right")
+    table.add_column("Mean", justify="right")
+    table.add_column("Std", justify="right")
+    table.add_column("Min", justify="right")
+    table.add_column("Median", justify="right")
+    table.add_column("Max", justify="right")
+
+    def _fmt(value: float | None) -> str:
+        if value is None:
+            return "—"
+        if abs(value) >= 1000 or (value != 0 and abs(value) < 0.001):
+            return f"{value:.3g}"
+        return f"{value:.4g}"
+
+    for column in profile.columns[:max_rows]:
+        missing = (
+            f"[red]{column.pct_missing:.1f}%[/red]"
+            if column.pct_missing > 0
+            else "[green]0%[/green]"
+        )
+        table.add_row(
+            escape(column.name),
+            column.dtype,
+            missing,
+            _fmt(column.mean),
+            _fmt(column.std),
+            _fmt(column.minimum),
+            _fmt(column.median),
+            _fmt(column.maximum),
+        )
+    console.print(table)
+    if len(profile.columns) > max_rows:
+        console.print(
+            f"[dim]… {len(profile.columns) - max_rows} more column(s). "
+            f"Use --max-rows to show them.[/dim]"
+        )
+
+    if profile.high_correlation_pairs:
+        corr_table = Table(title="Highly correlated pairs (|r| >= 0.8)")
+        corr_table.add_column("Column A", style="cyan")
+        corr_table.add_column("Column B", style="cyan")
+        corr_table.add_column("r", justify="right")
+        for a, b, r in profile.high_correlation_pairs[:20]:
+            colour = "red" if abs(r) >= 0.95 else "yellow"
+            corr_table.add_row(escape(a), escape(b), f"[{colour}]{r:+.4f}[/{colour}]")
+        console.print(corr_table)
+
+    for note in profile.notes:
+        console.print(f"[yellow][NOTE][/yellow] {note}")
+
+
+@cli.command()
+@click.argument("version_id")
+@click.option(
+    "--data", "-d", required=True, type=click.Path(exists=True, dir_okay=False),
+    help="CSV or Parquet file to test the DAG against.",
+)
+@click.option("--alpha", default=0.05, help="Significance level (default: 0.05).")
+def check(version_id: str, data: str, alpha: float) -> None:
+    """Test the conditional independencies this DAG implies against data.
+
+    This is the only evaluation in the engine whose result depends on the
+    graph's edges. The backtest score does not — it is computed from columns
+    attached to nodes and is identical if you reverse every arrow. A rejected
+    implication is real evidence against the structure: the data shows an
+    association the graph says should not be there.
+    """
+    from .analysis import test_implications
+
+    db = _get_db()
+    version = _load_version_or_exit(db, version_id)
+    df = _read_table_or_exit(data)
+
+    report = test_implications(version, df, alpha=alpha)
+
+    if report.unmapped_nodes:
+        console.print(
+            "[yellow][WARN][/yellow] No data column for: "
+            + ", ".join(escape(n) for n in report.unmapped_nodes)
+            + "\n[dim]  Bind them with: causal-engine bind "
+            f"{version_id} --node <label> --column <col>[/dim]\n"
+        )
+
+    if not report.tests:
+        console.print(
+            Panel(
+                "This DAG implies no conditional independencies — every pair of "
+                "nodes is adjacent.\n\n"
+                "A fully connected graph cannot be falsified by data. Removing "
+                "edges you do not believe in is what makes a causal hypothesis "
+                "testable.",
+                title="Nothing to test",
+                border_style="yellow",
+            )
+        )
+        return
+
+    table = Table(title="Implied conditional independencies")
+    table.add_column("Claim", style="cyan")
+    table.add_column("n", justify="right", style="dim")
+    table.add_column("Partial r", justify="right")
+    table.add_column("p", justify="right")
+    table.add_column("Verdict")
+
+    for test in report.tests:
+        if test.status == "rejected":
+            verdict = "[red]rejected[/red]"
+        elif test.status == "consistent":
+            verdict = "[green]consistent[/green]"
+        else:
+            verdict = "[dim]untestable[/dim]"
+        table.add_row(
+            escape(test.claim),
+            str(test.n) if test.n else "—",
+            f"{test.partial_correlation:+.4f}"
+            if test.partial_correlation is not None
+            else "—",
+            f"{test.p_value:.4g}" if test.p_value is not None else "—",
+            verdict,
+        )
+    console.print(table)
+
+    border = "red" if report.n_rejected else "green"
+    console.print(Panel(report.verdict, title="Verdict", border_style=border))
+
+    for test in report.tests:
+        if test.status == "rejected":
+            console.print(f"[red]•[/red] {escape(test.claim)} — {test.detail}")
+
+    console.print(
+        "\n[dim]Partial correlation assumes linear, jointly normal relationships. "
+        "A rejection is evidence to investigate, not proof the DAG is wrong. "
+        "No multiplicity correction is applied across tests.[/dim]"
+    )
+
+
 @cli.command()
 @click.argument("version_id")
 @click.option(
@@ -590,27 +913,19 @@ def doctor(bigquery: bool, financial: bool) -> None:
         _fail("ANTHROPIC_API_KEY",
               "not set — run: export ANTHROPIC_API_KEY=sk-...")
 
-    # -- SQLite DB (create + schema_version check)
+    # -- SQLite DB + WAL mode (single health probe, one connection)
     try:
-        db = _get_db()
-        with db._connect() as conn:
-            row = conn.execute("SELECT version FROM schema_version").fetchone()
-            schema_v = row["version"] if row else "?"
-        _ok("SQLite database", f"{_DEFAULT_DB}  schema_version={schema_v}")
-    except Exception as exc:
-        _fail("SQLite database", str(exc))
-
-    # -- WAL mode
-    try:
-        db = _get_db()
-        with db._connect() as conn:
-            wal_row = conn.execute("PRAGMA journal_mode").fetchone()
-        if wal_row and wal_row[0] == "wal":
+        health = _get_db().health()
+        _ok(
+            "SQLite database",
+            f"{health['db_path']}  schema_version={health['schema_version']}",
+        )
+        if health["journal_mode"].lower() == "wal":
             _ok("SQLite WAL mode", "enabled")
         else:
-            _warn("SQLite WAL mode", f"expected wal, got {wal_row[0] if wal_row else '?'}")
+            _warn("SQLite WAL mode", f"expected wal, got {health['journal_mode']}")
     except Exception as exc:
-        _warn("SQLite WAL mode", str(exc))
+        _fail("SQLite database", str(exc))
 
     # -- Checkpoint directory
     if _DEFAULT_CHECKPOINT_DIR.exists():

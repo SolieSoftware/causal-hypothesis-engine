@@ -31,7 +31,7 @@ from typing import Any
 
 from ..adapters.base import AdapterBase
 from ..adapters.insurance import InsuranceClaimsAdapter
-from ..models.backtest_result import BacktestResult
+from ..models.backtest_result import BacktestResult, NodeContribution
 from ..models.dag_version import DAGVersion, DAGVersionStatus
 from ..models.network import AdapterType, HypothesisNetwork
 from ..models.node import MeasurabilityState
@@ -215,14 +215,51 @@ class BacktestAgent:
         outcome_col = self.adapter.outcome_column(df)
         console.print(f"[dim]Scoring (outcome: '{outcome_col}')...[/dim]")
 
-        baseline_score = self.adapter.compute_baseline_score(df, outcome_col)
-        dag_score, node_contributions = self.adapter.compute_dag_score(
-            df, proxy_features, outcome_col
-        )
+        # `score_detail` returns the same scores plus the provenance and
+        # bootstrap intervals needed to interpret them. Adapters that predate
+        # it fall back to the plain interface.
+        node_map = {n.id: n.label for n in self.version.nodes}
+        if hasattr(self.adapter, "score_detail"):
+            detail = self.adapter.score_detail(df, proxy_features, outcome_col)
+            baseline_score = detail["baseline_score"]
+            dag_score = detail["dag_score"]
+            node_contributions = detail["node_contributions"]
+            lift_ci = detail.get("lift_ci", (None, None))
+            node_detail = detail.get("node_detail", {})
+            metric_name = detail.get("metric_name", "unknown")
+            extra = {
+                "metric_name": metric_name,
+                "n_rows": detail.get("n_rows", 0),
+                "n_positive": detail.get("n_positive", 0),
+                "n_features_baseline": detail.get("n_features_baseline", 0),
+                "n_features_dag": detail.get("n_features_dag", 0),
+                "cv_scheme": detail.get("cv_scheme", ""),
+                "random_seed": 42,
+                "lift_ci_low": lift_ci[0],
+                "lift_ci_high": lift_ci[1],
+            }
+        else:  # pragma: no cover - legacy adapter path
+            baseline_score = self.adapter.compute_baseline_score(df, outcome_col)
+            dag_score, node_contributions = self.adapter.compute_dag_score(
+                df, proxy_features, outcome_col
+            )
+            node_detail = {}
+            extra = {}
+
         lift = dag_score - baseline_score
 
+        contributions = [
+            NodeContribution(
+                node_id=node_id,
+                node_label=node_map.get(node_id, node_id[:8]),
+                contribution=round(value, 6),
+                ci_low=node_detail.get(node_id, (None, None))[0],
+                ci_high=node_detail.get(node_id, (None, None))[1],
+            )
+            for node_id, value in node_contributions.items()
+        ]
+
         # 5. Build result
-        notes = self._build_notes(node_contributions)
         result = BacktestResult(
             version_id=self.version.version_id,
             adapter_type=self.network.adapter.value,
@@ -230,7 +267,9 @@ class BacktestAgent:
             dag_score=round(dag_score, 6),
             lift=round(lift, 6),
             node_contributions={k: round(v, 6) for k, v in node_contributions.items()},
-            notes=notes,
+            contributions=contributions,
+            notes=self._build_notes(contributions),
+            **extra,
         )
 
         # 6. Persist — attach result, transition to Tested
@@ -252,56 +291,105 @@ class BacktestAgent:
         from rich.panel import Panel
         from rich.table import Table
 
-        lift_color = "green" if result.lift >= 0 else "red"
+        # Colour by significance, not by sign. A lift whose interval spans zero
+        # is not evidence of anything, and rendering it green because it
+        # happened to land above zero is how a graph of pure noise produces
+        # confident findings.
+        if result.lift_is_significant:
+            lift_color = "green" if result.lift > 0 else "red"
+        else:
+            lift_color = "yellow"
         lift_sign = "+" if result.lift >= 0 else ""
+
+        if result.lift_ci_low is not None:
+            interval = (
+                f"  [95% CI {result.lift_ci_low:+.4f} to {result.lift_ci_high:+.4f}]"
+            )
+            if not result.lift_is_significant:
+                interval += "  [yellow](spans zero)[/yellow]"
+        else:
+            interval = ""
+
+        provenance = ""
+        if result.metric_name != "unknown":
+            provenance = (
+                f"\nMetric:          {result.metric_name}\n"
+                f"Sample:          {result.n_rows:,} rows, "
+                f"{result.n_positive:,} positive\n"
+                f"CV:              {result.cv_scheme}\n"
+            )
 
         console.print(
             Panel(
                 f"Baseline score:  {result.baseline_score:.4f}\n"
                 f"DAG score:       {result.dag_score:.4f}\n"
-                f"Lift:            [{lift_color}]{lift_sign}{result.lift:.4f}[/{lift_color}]\n\n"
+                f"Lift:            [{lift_color}]{lift_sign}{result.lift:.4f}"
+                f"[/{lift_color}]{interval}\n"
+                f"{provenance}\n"
                 f"{self.adapter.describe_lift()}",
                 title="[bold]Backtest Result[/bold]",
             )
         )
 
-        if result.node_contributions:
+        if result.contributions:
             table = Table(title="Node Contributions", show_lines=False)
             table.add_column("Node ID", style="dim")
             table.add_column("Node Label")
             table.add_column("Contribution", justify="right")
-            table.add_column("Signal?", justify="center")
+            table.add_column("95% CI", justify="center")
+            table.add_column("Verdict", justify="center")
 
-            node_map = {n.id: n.label for n in self.version.nodes}
-            sorted_contribs = sorted(
-                result.node_contributions.items(), key=lambda x: x[1], reverse=True
-            )
-            for node_id, contrib in sorted_contribs:
-                label = node_map.get(node_id, node_id[:8])
-                contrib_str = f"{contrib:+.4f}"
-                signal = "[green]yes[/green]" if contrib > 0 else "[red]no[/red]"
-                table.add_row(node_id[:8], label, contrib_str, signal)
+            styles = {
+                "positive": "[green]adds signal[/green]",
+                "negative": "[red]hurts[/red]",
+                "inconclusive": "[yellow]inconclusive[/yellow]",
+            }
+            for item in sorted(
+                result.contributions, key=lambda c: c.contribution, reverse=True
+            ):
+                ci = (
+                    f"{item.ci_low:+.4f} … {item.ci_high:+.4f}"
+                    if item.ci_low is not None
+                    else "—"
+                )
+                table.add_row(
+                    item.node_id[:8],
+                    item.node_label,
+                    f"{item.contribution:+.4f}",
+                    ci,
+                    styles[item.verdict],
+                )
             console.print(table)
+            console.print(
+                "[dim]'inconclusive' means the interval spans zero — the data "
+                "cannot distinguish this node's contribution from nothing. It is "
+                "not grounds to remove the node.[/dim]"
+            )
 
         console.print(
             f"\n[bold green]Version {self.version.version_id[:8]} → Tested[/bold green]"
         )
 
-    def _build_notes(self, node_contributions: dict[str, float]) -> str:
-        node_map = {n.id: n.label for n in self.version.nodes}
-        added_signal = [
-            node_map.get(nid, nid[:8])
-            for nid, contrib in node_contributions.items()
-            if contrib > 0
-        ]
-        no_signal = [
-            node_map.get(nid, nid[:8])
-            for nid, contrib in node_contributions.items()
-            if contrib <= 0
-        ]
-        parts = []
-        if added_signal:
-            parts.append(f"Added signal: {', '.join(added_signal)}.")
-        if no_signal:
-            parts.append(f"No signal: {', '.join(no_signal)}.")
+    def _build_notes(self, contributions: list[NodeContribution]) -> str:
+        """Summarise contributions by *verdict*, not by sign.
+
+        These notes are fed verbatim into the ModificationAgent's context, so
+        a sign-based "no signal" label here becomes the LLM's justification for
+        proposing that a node be deleted. Only a node whose interval lies
+        wholly below zero has actually been shown to hurt.
+        """
+        buckets: dict[str, list[str]] = {"positive": [], "negative": [], "inconclusive": []}
+        for item in contributions:
+            buckets[item.verdict].append(item.node_label)
+
+        parts: list[str] = []
+        if buckets["positive"]:
+            parts.append(f"Adds signal: {', '.join(buckets['positive'])}.")
+        if buckets["negative"]:
+            parts.append(f"Hurts predictive performance: {', '.join(buckets['negative'])}.")
+        if buckets["inconclusive"]:
+            parts.append(
+                "Contribution indistinguishable from zero (NOT evidence of no "
+                f"effect): {', '.join(buckets['inconclusive'])}."
+            )
         return " ".join(parts)

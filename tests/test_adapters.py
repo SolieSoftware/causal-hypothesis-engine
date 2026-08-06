@@ -185,11 +185,30 @@ class TestValidateData:
         missing_in_errors = errors[0]
         assert "claim_amount" in missing_in_errors or "is_large_claim" in missing_in_errors
 
-    def test_unknown_claim_type(self, adapter: InsuranceClaimsAdapter) -> None:
+    def test_unknown_claim_type_is_a_warning_not_an_error(
+        self, adapter: InsuranceClaimsAdapter
+    ) -> None:
+        """Real books contain claim types outside the recognised five.
+
+        Hard-failing made the adapter unusable with any genuine extract, so
+        unknown types are folded into "other" and reported as a warning.
+        """
         df = _make_df(10)
         df.loc[0, "claim_type"] = "earthquake"
-        errors = adapter.validate_data(df)
-        assert any("earthquake" in e for e in errors)
+
+        assert adapter.validate_data(df) == []
+        assert any("earthquake" in w for w in adapter.data_warnings(df))
+
+    def test_unknown_claim_type_folded_into_other(
+        self, adapter: InsuranceClaimsAdapter
+    ) -> None:
+        df = _make_df(10)
+        df.loc[0, "claim_type"] = "earthquake"
+        baseline = adapter._baseline_features(df)
+
+        # Fixed category set: one column per recognised type, no "ct_earthquake".
+        assert "ct_earthquake" not in baseline.columns
+        assert baseline.loc[0, "ct_other"] == 1.0
 
     def test_invalid_outcome_values(self, adapter: InsuranceClaimsAdapter) -> None:
         df = _make_df(10)
@@ -245,9 +264,16 @@ class TestBuildProxyFeatures:
         )
         version = DAGVersion(network_id="net-1", nodes=[node])
         features = adapter.build_proxy_features(sample_df, version)
-        assert not features.empty
-        col = [c for c in features.columns if "ndvi_index" in c][0]
-        assert features[col].isna().all()
+
+        # A missing column is excluded, not zero-filled. Zero-filling made
+        # "this column isn't in your file" indistinguishable from "we measured
+        # it and it has no signal" — and the modification agent treats the
+        # latter as grounds to delete the node.
+        assert features.empty
+        assert any(
+            "ndvi_index" in w and "not in the data file" in w
+            for w in adapter.feature_warnings
+        )
 
     def test_no_proxied_nodes_returns_empty(
         self, adapter: InsuranceClaimsAdapter, sample_df: pd.DataFrame

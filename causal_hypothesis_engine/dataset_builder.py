@@ -107,7 +107,7 @@ class DatasetBuilder:
                     "Fix: Check spelling in manifest or DAG."
                 )
             warnings.append(msg)
-            logger.warning(msg)
+            logger.debug(msg)
 
         for label in version_labels - manifest_labels:
             msg = (
@@ -115,7 +115,7 @@ class DatasetBuilder:
                 "manifest column — it will be absent from the dataset."
             )
             warnings.append(msg)
-            logger.warning(msg)
+            logger.debug(msg)
 
         # ------------------------------------------------------------------
         # Step 4 + 5: ADF tests with optional auto-diff
@@ -143,7 +143,7 @@ class DatasetBuilder:
                     f"— ADF test skipped (need >= {_MIN_OBS_FOR_ADF})."
                 )
                 warnings.append(msg)
-                logger.warning(msg)
+                logger.debug(msg)
                 adf_results[label] = {
                     "statistic": None,
                     "pvalue": None,
@@ -159,7 +159,7 @@ class DatasetBuilder:
             except Exception as exc:
                 msg = f"[WARN] ADF test raised for \"{label}\": {exc}"
                 warnings.append(msg)
-                logger.warning(msg)
+                logger.debug(msg)
                 adf_results[label] = {
                     "statistic": None,
                     "pvalue": None,
@@ -190,12 +190,16 @@ class DatasetBuilder:
                     f"and has only {len(series_diff)} observations — included as-is."
                 )
                 warnings.append(msg)
-                logger.warning(msg)
+                logger.debug(msg)
                 adf_results[label] = {
                     "statistic": float(adf_stat),
                     "pvalue": float(pvalue),
                     "passed": False,
-                    "transform_applied": compound,
+                    # The extra diff was NOT applied — this branch writes the
+                    # undifferenced series, so the declared transform is what
+                    # the data actually reflects. Recording `compound` here
+                    # made the metadata contradict the Parquet contents.
+                    "transform_applied": declared,
                 }
                 final_series[label] = series
                 continue
@@ -205,12 +209,13 @@ class DatasetBuilder:
             except Exception as exc:
                 msg = f"[WARN] ADF re-test raised for \"{label}\": {exc}"
                 warnings.append(msg)
-                logger.warning(msg)
+                logger.debug(msg)
                 adf_results[label] = {
                     "statistic": float(adf_stat),
                     "pvalue": float(pvalue),
                     "passed": False,
-                    "transform_applied": compound,
+                    # As above: the undifferenced series is what gets written.
+                    "transform_applied": declared,
                 }
                 final_series[label] = series
                 continue
@@ -226,10 +231,10 @@ class DatasetBuilder:
             else:
                 msg = (
                     f"[WARN] Series \"{label}\" still non-stationary after extra diff "
-                    "(p={pvalue2:.4f}) — included as-is."
+                    f"(p={pvalue2:.4f}) — included as-is."
                 )
                 warnings.append(msg)
-                logger.warning(msg)
+                logger.debug(msg)
                 adf_results[label] = {
                     "statistic": float(adf_stat2),
                     "pvalue": float(pvalue2),
@@ -254,7 +259,7 @@ class DatasetBuilder:
         # ------------------------------------------------------------------
         if out_path is None:
             _DEFAULT_DATASETS_DIR.mkdir(parents=True, exist_ok=True)
-            timestamp = pd.Timestamp.utcnow().strftime("%Y%m%dT%H%M%SZ")
+            timestamp = pd.Timestamp.now("UTC").strftime("%Y%m%dT%H%M%SZ")
             manifest_stem = manifest_path.stem
             out_path = (
                 _DEFAULT_DATASETS_DIR

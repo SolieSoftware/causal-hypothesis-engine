@@ -231,6 +231,61 @@ def _fetch_file(config: NodeFetchConfig, start_date: str, end_date: str) -> pd.S
     return series
 
 
+# Manifests are shareable artifacts, so a manifest-supplied URL is not
+# necessarily trusted input. Without these guards `source: url_csv` is an SSRF
+# primitive: it would happily fetch http://169.254.169.254/latest/meta-data/
+# or any service on localhost and surface the response in the output Parquet.
+_MAX_URL_CSV_BYTES = 64 * 1024 * 1024
+
+
+def _validate_fetch_url(url: str) -> None:
+    """Reject non-HTTP schemes and hosts that resolve to private addresses."""
+    import ipaddress
+    import socket
+    from urllib.parse import urlparse
+
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(
+            f"[ERROR] Problem: Unsupported URL scheme '{parsed.scheme}'. "
+            "Cause: Only http and https are allowed for url_csv sources. "
+            "Fix: Use an http(s) URL, or source: file for a local path."
+        )
+    host = parsed.hostname
+    if not host:
+        raise ValueError(
+            "[ERROR] Problem: URL has no host. "
+            "Cause: Malformed url in the manifest. "
+            "Fix: Supply a full URL, e.g. https://example.com/data.csv"
+        )
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror as exc:
+        raise RuntimeError(
+            f"[ERROR] Problem: Could not resolve host '{host}'. "
+            f"Cause: {exc}. "
+            "Fix: Check the URL is reachable."
+        ) from exc
+
+    for info in infos:
+        address = ipaddress.ip_address(info[4][0])
+        if (
+            address.is_private
+            or address.is_loopback
+            or address.is_link_local
+            or address.is_reserved
+            or address.is_multicast
+        ):
+            raise ValueError(
+                f"[ERROR] Problem: Refusing to fetch from '{host}' "
+                f"({address}). "
+                "Cause: It resolves to a private, loopback or link-local "
+                "address — fetching it could expose internal services or cloud "
+                "instance metadata. "
+                "Fix: Use a public URL, or source: file for local data."
+            )
+
+
 def _fetch_url_csv(config: NodeFetchConfig, start_date: str, end_date: str) -> pd.Series:
     url = config.get("url")
     if not url:
@@ -239,12 +294,29 @@ def _fetch_url_csv(config: NodeFetchConfig, start_date: str, end_date: str) -> p
             "Fix: Add url to the manifest node."
         )
 
+    _validate_fetch_url(url)
+
     date_col = config.get("date_column", "date")
     value_col = config.get("value_column", "value")
 
     try:
         import requests  # type: ignore[import-untyped]
-        response = requests.get(url, timeout=30)
+
+        response = requests.get(
+            url,
+            timeout=30,
+            allow_redirects=False,
+            stream=True,
+            headers={"Accept": "text/csv, text/plain, */*"},
+        )
+        # Cap the body before it is materialised. `response.text` would buffer
+        # an arbitrarily large remote file straight into memory.
+        body = response.raw.read(_MAX_URL_CSV_BYTES + 1, decode_content=True)
+        if len(body) > _MAX_URL_CSV_BYTES:
+            raise RuntimeError(
+                f"Response exceeds the {_MAX_URL_CSV_BYTES // (1024 * 1024)}MB limit."
+            )
+        response._content = body  # noqa: SLF001 - keep `.text` consistent
     except Exception as exc:
         raise RuntimeError(
             f"[ERROR] Problem: Could not fetch CSV from URL. "
