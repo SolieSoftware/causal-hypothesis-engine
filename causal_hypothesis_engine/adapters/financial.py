@@ -30,6 +30,7 @@ else:
 
 import pandas as pd
 
+from ..models.node import NodeType
 from .base import AdapterBase, NodeMetadataSchema
 
 if TYPE_CHECKING:
@@ -377,10 +378,17 @@ class FinancialDataAdapter(AdapterBase):
     Reads a YAML manifest file that maps DAGVersion node labels to real data
     sources (FRED, Yahoo Finance, local file, or direct-URL CSV).
 
-    BacktestAgent integration is deferred to v2 — compute_dag_score returns
-    0.0 and outcome_column raises NotImplementedError.  check_can_backtest()
-    in BacktestAgent will block invocation before either method is reached.
+    Scoring is implemented: the Outcome node's series is predicted from every
+    other node's series, out-of-fold, with paired bootstrap intervals. Note
+    what this does and does not establish — the feature matrix is strictly
+    contemporaneous, so the result is a predictive association at the same
+    timestamp, not a causal effect and not a forecast. Use `causal-engine
+    check` to test whether the graph's *structure* survives the data.
     """
+
+    def __init__(self, outcome_column_name: str | None = None) -> None:
+        self._outcome_column = outcome_column_name
+        self._feature_warnings: list[str] = []
 
     @property
     def domain_label(self) -> str:
@@ -491,12 +499,20 @@ class FinancialDataAdapter(AdapterBase):
     # ------------------------------------------------------------------
 
     def load_data(self, path: str | Path) -> pd.DataFrame:
-        """Load a financial dataset from a YAML manifest file.
+        """Load a financial dataset from a manifest *or* a built feature matrix.
 
-        *path* is the path to a manifest YAML file (not a CSV/Parquet file).
-        Overrides the base class file-based loader.
+        A YAML path is fetched and assembled from source; a ``.parquet`` or
+        ``.csv`` path is read directly. Accepting both matters because the
+        normal workflow is ``causal-engine dataset`` (which writes Parquet)
+        followed by ``causal-engine backtest --data <that parquet>``.
         """
-        df, _, _ = self._load_manifest_data(path)
+        file_path = Path(path)
+        suffix = file_path.suffix.lower()
+        if suffix in {".parquet", ".pq"}:
+            return pd.read_parquet(file_path)
+        if suffix == ".csv":
+            return pd.read_csv(file_path, index_col=0, parse_dates=True)
+        df, _, _ = self._load_manifest_data(file_path)
         return df
 
     def validate_data(self, df: pd.DataFrame) -> list[str]:
@@ -510,36 +526,119 @@ class FinancialDataAdapter(AdapterBase):
         df: pd.DataFrame,
         version: "DAGVersion",
     ) -> pd.DataFrame:
-        """Return df columns whose names match DAGVersion node labels.
+        """Return one column per non-outcome node, keyed ``{node_id}__{column}``.
 
-        Columns in df that have no matching node, and nodes with no column,
-        both emit [WARN] log messages.
+        A node is matched to a column by its bound ``proxy_variables`` first,
+        then by an exact label match — the dataset pipeline names columns after
+        node labels, so label matching is the common case here.
         """
-        version_labels = {n.label for n in version.nodes}
-        matching = [col for col in df.columns if col in version_labels]
-        for label in version_labels - set(df.columns):
-            logger.warning(
-                "[WARN] Node '%s' in DAGVersion has no column in the dataset.", label
-            )
-        return df[matching]
+        outcome = self._outcome_column or ""
+        columns: dict[str, pd.Series] = {}
+        warnings: list[str] = []
 
-    def outcome_column(self, df: pd.DataFrame) -> str:  # type: ignore[override]
-        raise NotImplementedError(
-            "FinancialDataAdapter does not define an outcome column in v1. "
-            "BacktestAgent integration is deferred. "
-            "check_can_backtest() blocks invocation before this is reached."
+        for node in version.nodes:
+            if node.node_type == NodeType.Outcome:
+                continue
+            name = self._column_for_node(node, df)
+            if name is None:
+                warnings.append(
+                    f"Node '{node.label}' has no column in the dataset — "
+                    "excluded from scoring."
+                )
+                continue
+            if name == outcome:
+                continue
+            columns[f"{node.id}__{name}"] = df[name].copy()
+
+        self._feature_warnings = warnings
+        for warning in warnings:
+            logger.warning(warning)
+
+        if not columns:
+            return pd.DataFrame(index=df.index)
+        return pd.DataFrame(columns, index=df.index)
+
+    @staticmethod
+    def _column_for_node(node, df: pd.DataFrame) -> str | None:
+        for candidate in (node.adapter_metadata or {}).get("proxy_variables", []):
+            if candidate in df.columns:
+                return candidate
+        if node.label in df.columns:
+            return node.label
+        return None
+
+    @property
+    def feature_warnings(self) -> list[str]:
+        return list(getattr(self, "_feature_warnings", []))
+
+    def resolve_outcome(self, df: pd.DataFrame, version: "DAGVersion") -> str:
+        """Determine which column is the outcome for *version*.
+
+        Order: an explicit ``--outcome``; ``outcome_column`` declared on any
+        node; the Outcome node's bound proxy or matching label.
+        """
+        from ..scoring import ScoringError
+
+        if self._outcome_column:
+            if self._outcome_column not in df.columns:
+                raise ScoringError(
+                    f"Problem: Outcome column '{self._outcome_column}' is not "
+                    "in the dataset.\n"
+                    f"  Cause: Available columns are {list(df.columns)}.\n"
+                    "  Fix: Pass --outcome with a column that exists."
+                )
+            return self._outcome_column
+
+        for node in version.nodes:
+            declared = (node.adapter_metadata or {}).get("outcome_column")
+            if declared and declared in df.columns:
+                self._outcome_column = declared
+                return declared
+
+        for node in version.nodes:
+            if node.node_type != NodeType.Outcome:
+                continue
+            name = self._column_for_node(node, df)
+            if name is not None:
+                self._outcome_column = name
+                return name
+
+        raise ScoringError(
+            "Problem: Cannot determine which column is the outcome.\n"
+            "  Cause: No --outcome given, and the DAG's Outcome node has no "
+            "matching column in the dataset.\n"
+            "  Fix: Pass --outcome <column>, or make sure the Outcome node's "
+            "label matches a manifest node label."
         )
+
+    def outcome_column(self, df: pd.DataFrame) -> str:
+        from ..scoring import ScoringError
+
+        if self._outcome_column and self._outcome_column in df.columns:
+            return self._outcome_column
+        raise ScoringError(
+            "Problem: Outcome column has not been resolved.\n"
+            "  Cause: The financial adapter needs an outcome before scoring.\n"
+            "  Fix: Pass --outcome <column>."
+        )
+
+    def _baseline_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Empty by design.
+
+        There is no set of "free" covariates for an arbitrary macro series, so
+        lift is measured against the no-information score. That makes it read
+        as "how much do the DAG's series explain the outcome".
+        """
+        return pd.DataFrame(index=df.index)
 
     def compute_baseline_score(
         self,
         df: pd.DataFrame,
         outcome_col: str,
     ) -> float:
-        logger.warning(
-            "FinancialDataAdapter.compute_baseline_score is not implemented in v1. "
-            "Returning 0.0."
-        )
-        return 0.0
+        from ..scoring import is_binary
+
+        return 0.5 if is_binary(df[outcome_col]) else 0.0
 
     def compute_dag_score(
         self,
@@ -547,14 +646,49 @@ class FinancialDataAdapter(AdapterBase):
         proxy_features: pd.DataFrame,
         outcome_col: str,
     ) -> tuple[float, dict[str, float]]:
-        logger.warning(
-            "FinancialDataAdapter.compute_dag_score is not implemented in v1. "
-            "BacktestAgent integration is deferred. Returning 0.0."
+        detail = self.score_detail(df, proxy_features, outcome_col)
+        return detail["dag_score"], detail["node_contributions"]
+
+    def score_detail(
+        self,
+        df: pd.DataFrame,
+        proxy_features: pd.DataFrame,
+        outcome_col: str,
+    ) -> dict:
+        """Score the DAG's series against the outcome series.
+
+        Rows with any missing value are dropped first: the dataset pipeline
+        joins series on the union of their indices, so a feature matrix can
+        look complete while few rows have every column present.
+        """
+        from ..scoring import score_nested
+
+        combined = pd.concat([df[[outcome_col]], proxy_features], axis=1).dropna()
+        y = combined[outcome_col]
+        features = combined.drop(columns=[outcome_col])
+        outcome = score_nested(
+            pd.DataFrame(index=combined.index), features, y
         )
-        return 0.0, {}
+        return {
+            "baseline_score": outcome.baseline_score,
+            "dag_score": outcome.dag_score,
+            "lift": outcome.lift,
+            "lift_ci": outcome.lift_ci,
+            "node_contributions": outcome.node_contributions,
+            "node_detail": outcome.node_detail,
+            "metric_name": outcome.metric_name,
+            "n_rows": outcome.n_rows,
+            "n_positive": outcome.n_positive,
+            "n_features_baseline": outcome.n_features_baseline,
+            "n_features_dag": outcome.n_features_dag,
+            "cv_scheme": outcome.cv_scheme,
+        }
 
     def describe_lift(self) -> str:
         return (
-            "Predictive lift of DAG-derived financial features "
-            "over a baseline model (v2, not yet implemented)."
+            "Lift is how much the DAG's series improve out-of-fold prediction "
+            "of the outcome series over a no-information baseline. Intervals "
+            "are paired percentile bootstrap; a lift whose interval spans zero "
+            "is not distinguishable from no effect. Note this measures "
+            "contemporaneous predictive association, not a causal effect."
         )

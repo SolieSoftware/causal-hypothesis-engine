@@ -92,19 +92,23 @@ class TestDatabaseSchema:
         Database(db_path)
         assert db_path.exists()
 
-    def test_schema_version_is_1(self, tmp_db: Database) -> None:
+    def test_schema_version_matches_current(self, tmp_db: Database) -> None:
+        from causal_hypothesis_engine.persistence.db import CURRENT_SCHEMA_VERSION
+
         with tmp_db._connect() as conn:
             row = conn.execute("SELECT version FROM schema_version").fetchone()
-        assert row["version"] == 1
+        assert row["version"] == CURRENT_SCHEMA_VERSION
 
     def test_idempotent_reinit(self, tmp_path: Path) -> None:
         """Opening the same DB twice must not raise or reset schema_version."""
+        from causal_hypothesis_engine.persistence.db import CURRENT_SCHEMA_VERSION
+
         db_path = tmp_path / "test.db"
         Database(db_path)
         db2 = Database(db_path)
         with db2._connect() as conn:
             row = conn.execute("SELECT version FROM schema_version").fetchone()
-        assert row["version"] == 1
+        assert row["version"] == CURRENT_SCHEMA_VERSION
 
     def test_wal_mode_enabled(self, tmp_db: Database) -> None:
         with tmp_db._connect() as conn:

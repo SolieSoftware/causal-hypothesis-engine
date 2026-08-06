@@ -118,9 +118,13 @@ def cli() -> None:
 @click.option(
     "--adapter",
     "-a",
-    type=click.Choice(["none", "Insurance", "Financial", "Clinical"], case_sensitive=False),
+    # Clinical is deliberately absent: it has no implementation, and offering
+    # it silently created networks that could never be backtested.
+    type=click.Choice(
+        ["none", "Tabular", "Insurance", "Financial"], case_sensitive=False
+    ),
     default="none",
-    help="Adapter type.",
+    help="Adapter type. Tabular works with any CSV/Parquet.",
 )
 def new(name: str, domain: str, adapter: str) -> None:
     """Start a new hypothesis network and launch a DAGAgent session."""
@@ -192,6 +196,7 @@ def resume(session_id: str | None, last: bool) -> None:
 
     # Load draft state from checkpoint if available.
     draft: DraftState | None = None
+    draft_version = None
     if session.checkpoint_path and Path(session.checkpoint_path).exists():
         try:
             _, draft_version = load_checkpoint(session.checkpoint_path)
@@ -204,6 +209,39 @@ def resume(session_id: str | None, last: bool) -> None:
             console.print(f"[yellow]Could not load checkpoint: {exc}[/yellow]")
     else:
         console.print("[yellow]No checkpoint found — starting from empty DAG.[/yellow]")
+
+    # Resume the kind of session that was interrupted. Previously every resume
+    # built a DAGAgent, so resuming a Modification session drove it with the
+    # DAG-*creation* prompt and saved a version with parent_version_id=None and
+    # an empty rationale — silently destroying the lineage the session existed
+    # to record, while the DB row still claimed mode=Modification.
+    if session.mode == SessionMode.Modification:
+        source_version = None
+        if draft_version is not None and draft_version.parent_version_id:
+            source_version = db.get_version(draft_version.parent_version_id)
+        if source_version is None:
+            console.print(
+                "[bold red][ERROR][/bold red] Problem: Cannot resume this "
+                "modification session.\n"
+                "  Cause: Its source version could not be resolved from the "
+                "checkpoint, so parent linkage and rationale would be lost.\n"
+                "  Fix: Start a fresh session with [bold]causal-engine modify "
+                "<version-id>[/bold]."
+            )
+            sys.exit(1)
+
+        console.print(
+            f"[dim]Resuming modification of "
+            f"{source_version.version_id[:8]}[/dim]"
+        )
+        ModificationAgent(
+            db=db,
+            network=network,
+            source_version=source_version,
+            session=session,
+            checkpoint_dir=_DEFAULT_CHECKPOINT_DIR,
+        ).run(console)
+        return
 
     agent = DAGAgent(
         db=db,
@@ -354,7 +392,15 @@ def modify(version_id: str, mode: str) -> None:
     type=click.Path(exists=True, dir_okay=False),
     help="Path to the CSV or Parquet data file.",
 )
-def backtest(version_id: str, data: str) -> None:
+@click.option(
+    "--outcome",
+    default=None,
+    help=(
+        "Column to predict. Required for the Tabular adapter unless the "
+        "Outcome node is bound; the Insurance adapter derives its own."
+    ),
+)
+def backtest(version_id: str, data: str, outcome: str | None) -> None:
     """Run BacktestAgent on a DAGVersion and attach the result."""
     db = _get_db()
 
@@ -380,7 +426,13 @@ def backtest(version_id: str, data: str) -> None:
         sys.exit(1)
 
     try:
-        agent = BacktestAgent(db=db, network=network, version=version, data_path=data)
+        agent = BacktestAgent(
+            db=db,
+            network=network,
+            version=version,
+            data_path=data,
+            outcome_column=outcome,
+        )
         agent.run(console)
     except (FileNotFoundError, ValueError) as exc:
         console.print(f"[bold red][ERROR][/bold red] {exc}")
@@ -864,10 +916,23 @@ def dataset(version_id: str, manifest: str, out: str | None, strict: bool) -> No
         t.add_row(label, adf.get("transform_applied", "—"), stat, pval, passed)
 
     console.print(t)
+
+    # Record the dataset against the version, so "which data belongs to this
+    # hypothesis?" is answerable later. The Parquet used to be an orphan file.
+    db.save_dataset_result(result)
+
     console.print(
         f"\n[green]✓[/green] Dataset written to: [bold]{result.output_path}[/bold]\n"
         f"  Columns ({len(result.columns)}): {', '.join(result.columns)}\n"
-        f"  Date range: {result.start_date} → {result.end_date}  [{result.frequency}]"
+        f"  Date range: {result.start_date} → {result.end_date}  [{result.frequency}]\n"
+        f"  Linked to version [cyan]{version.version_id[:8]}[/cyan] "
+        f"(dataset id {result.id[:8]})"
+    )
+    console.print(
+        f"\n[dim]Next:[/dim] causal-engine explore "
+        f"[yellow]{result.output_path}[/yellow]\n"
+        f"      causal-engine check [yellow]{version.version_id}[/yellow] "
+        f"--data {result.output_path}"
     )
 
 

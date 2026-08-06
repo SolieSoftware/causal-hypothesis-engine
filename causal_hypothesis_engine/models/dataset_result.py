@@ -2,16 +2,24 @@
 
 from __future__ import annotations
 
-from pydantic import BaseModel
+import uuid
+from datetime import datetime
+
+from pydantic import BaseModel, Field
+
+from .._time import utcnow
 
 
 class DatasetResult(BaseModel):
     """Captures the outcome of a DatasetBuilder.run() call.
 
-    Stored to disk as JSON alongside the Parquet file.  Not persisted to
-    SQLite in v1 — DB attachment is deferred until BacktestAgent integration.
+    Persisted to SQLite (``dataset_results``) and keyed by ``version_id``, so
+    the question "which data belongs to this hypothesis?" is answerable. It
+    used to exist only as an in-memory object beside an orphan Parquet file.
     """
 
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    created_at: datetime = Field(default_factory=utcnow)
     version_id: str
     manifest_path: str
     columns: list[str]       # one per manifest node label, in manifest order

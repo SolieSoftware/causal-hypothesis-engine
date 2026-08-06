@@ -30,7 +30,9 @@ from pathlib import Path
 from typing import Any
 
 from ..adapters.base import AdapterBase
+from ..adapters.financial import FinancialDataAdapter
 from ..adapters.insurance import InsuranceClaimsAdapter
+from ..adapters.tabular import TabularAdapter
 from ..models.backtest_result import BacktestResult, NodeContribution
 from ..models.dag_version import DAGVersion, DAGVersionStatus
 from ..models.network import AdapterType, HypothesisNetwork
@@ -45,10 +47,14 @@ logger = logging.getLogger(__name__)
 
 _ADAPTER_REGISTRY: dict[AdapterType, type[AdapterBase]] = {
     AdapterType.Insurance: InsuranceClaimsAdapter,
+    AdapterType.Tabular: TabularAdapter,
+    AdapterType.Financial: FinancialDataAdapter,
 }
 
 
-def get_adapter(adapter_type: AdapterType) -> AdapterBase:
+def get_adapter(
+    adapter_type: AdapterType, outcome_column: str | None = None
+) -> AdapterBase:
     """Return an instantiated adapter for *adapter_type*.
 
     Raises:
@@ -60,6 +66,10 @@ def get_adapter(adapter_type: AdapterType) -> AdapterBase:
             f"No adapter registered for AdapterType.{adapter_type.value}. "
             f"Available: {[t.value for t in _ADAPTER_REGISTRY]}"
         )
+    # Adapters that need an explicit outcome accept it; the insurance adapter
+    # derives its own, so it takes no argument.
+    if outcome_column is not None and cls is not InsuranceClaimsAdapter:
+        return cls(outcome_column)  # type: ignore[call-arg]
     return cls()
 
 
@@ -93,25 +103,32 @@ def check_can_backtest(
         )
 
     if network.adapter not in _ADAPTER_REGISTRY:
+        available = ", ".join(sorted(a.value for a in _ADAPTER_REGISTRY))
         raise BacktestPreflightError(
-            f"Problem: Adapter '{network.adapter.value}' is not yet implemented.\n"
-            "  Cause: Only Insurance is available in v1.\n"
-            "  Fix: Use --adapter Insurance."
+            f"Problem: Adapter '{network.adapter.value}' has no implementation.\n"
+            f"  Cause: Scoring is available for: {available}.\n"
+            "  Fix: Create the network with one of those adapters."
         )
 
-    proxied = [
-        n for n in version.nodes
-        if n.measurability_state == MeasurabilityState.Proxied
-        and n.adapter_metadata
-        and n.adapter_metadata.get("proxy_variables")
-    ]
-    if not proxied:
-        raise BacktestPreflightError(
-            "Problem: No Proxied nodes with proxy_variables found in this version.\n"
-            "  Cause: BacktestAgent needs at least one node with measurability_state "
-            "= Proxied and proxy_variables set in its adapter_metadata.\n"
-            "  Fix: Update node measurability states and add proxy_variables."
-        )
+    # The Financial adapter matches nodes to dataset columns by label, so it
+    # does not require explicit binding; the others do.
+    if network.adapter != AdapterType.Financial:
+        measured = [
+            n for n in version.nodes
+            if n.measurability_state
+            in (MeasurabilityState.Proxied, MeasurabilityState.Validated)
+            and n.adapter_metadata
+            and n.adapter_metadata.get("proxy_variables")
+        ]
+        if not measured:
+            raise BacktestPreflightError(
+                "Problem: No node in this version is bound to a data column.\n"
+                "  Cause: Scoring needs at least one node with "
+                "measurability_state Proxied or Validated and proxy_variables "
+                "set.\n"
+                "  Fix: causal-engine bind <version-id> --node <label> "
+                "--column <column>"
+            )
 
     if version.is_immutable:
         raise BacktestPreflightError(
@@ -143,12 +160,14 @@ class BacktestAgent:
         network: HypothesisNetwork,
         version: DAGVersion,
         data_path: str | Path,
+        outcome_column: str | None = None,
     ) -> None:
         self.db = db
         self.network = network
         self.version = version
         self.data_path = Path(data_path)
-        self.adapter = get_adapter(network.adapter)
+        self.outcome_column = outcome_column
+        self.adapter = get_adapter(network.adapter, outcome_column=outcome_column)
 
     # ------------------------------------------------------------------
     # Public: run the automated pipeline
@@ -197,9 +216,19 @@ class BacktestAgent:
             raise ValueError(f"Data validation failed: {errors}")
         console.print("[dim]  Validation passed.[/dim]")
 
+        for warning in getattr(self.adapter, "data_warnings", lambda _: [])(df):
+            console.print(f"[yellow][WARN][/yellow] {warning}")
+
+        # 2b. Resolve the outcome column. Adapters with a fixed schema derive
+        # it themselves; the generic and financial adapters need it declared.
+        if hasattr(self.adapter, "resolve_outcome"):
+            self.adapter.resolve_outcome(df, self.version)
+
         # 3. Build proxy features
         console.print("[dim]Building proxy features...[/dim]")
         proxy_features = self.adapter.build_proxy_features(df, self.version)
+        for warning in getattr(self.adapter, "feature_warnings", []):
+            console.print(f"[yellow][WARN][/yellow] {warning}")
         proxied_count = len([
             n for n in self.version.nodes
             if n.measurability_state == MeasurabilityState.Proxied

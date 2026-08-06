@@ -20,6 +20,7 @@ from typing import Any
 
 from causal_hypothesis_engine.models.backtest_result import BacktestResult
 from causal_hypothesis_engine.models.dag_version import DAGVersion, DAGVersionStatus
+from causal_hypothesis_engine.models.dataset_result import DatasetResult
 from causal_hypothesis_engine.models.edge import Edge
 from causal_hypothesis_engine.models.network import AdapterType, HypothesisNetwork
 from causal_hypothesis_engine.models.node import Node
@@ -83,9 +84,39 @@ _MIGRATIONS: list[tuple[int, str]] = [
         );
         """,
     ),
+    (
+        2,
+        # DatasetResult persistence. Datasets were previously written to disk
+        # as orphan Parquet files with no record in the database, so there was
+        # no way to answer "which data belongs to this hypothesis?".
+        """
+        CREATE TABLE IF NOT EXISTS dataset_results (
+            id            TEXT PRIMARY KEY,
+            version_id    TEXT NOT NULL,
+            manifest_path TEXT NOT NULL,
+            output_path   TEXT NOT NULL,
+            columns_json  TEXT NOT NULL,
+            start_date    TEXT NOT NULL,
+            end_date      TEXT NOT NULL,
+            frequency     TEXT NOT NULL,
+            adf_json      TEXT NOT NULL,
+            warnings_json TEXT NOT NULL,
+            created_at    TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_dataset_results_version
+            ON dataset_results(version_id);
+
+        CREATE INDEX IF NOT EXISTS idx_dag_versions_network
+            ON dag_versions(network_id);
+
+        CREATE INDEX IF NOT EXISTS idx_sessions_network
+            ON sessions(network_id);
+        """,
+    ),
 ]
 
-CURRENT_SCHEMA_VERSION = 1
+CURRENT_SCHEMA_VERSION = 2
 
 
 # ---------------------------------------------------------------------------
@@ -527,4 +558,63 @@ class Database:
             created_at=_str_to_dt(row["created_at"]),
             last_activity=_str_to_dt(row["last_activity"]),
             exchange_count=row["exchange_count"],
+        )
+
+    # ------------------------------------------------------------------
+    # Dataset results
+    # ------------------------------------------------------------------
+
+    def save_dataset_result(self, result: DatasetResult) -> None:
+        """Insert or replace a DatasetResult row."""
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO dataset_results
+                    (id, version_id, manifest_path, output_path, columns_json,
+                     start_date, end_date, frequency, adf_json, warnings_json,
+                     created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    result.id,
+                    result.version_id,
+                    result.manifest_path,
+                    result.output_path,
+                    json.dumps(result.columns),
+                    result.start_date,
+                    result.end_date,
+                    result.frequency,
+                    json.dumps(result.adf_results),
+                    json.dumps(result.warnings),
+                    _dt_to_str(result.created_at),
+                ),
+            )
+
+    def get_dataset_results_for_version(self, version_id: str) -> list[DatasetResult]:
+        """Return every dataset built for *version_id*, newest first."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM dataset_results
+                WHERE version_id = ?
+                ORDER BY created_at DESC
+                """,
+                (version_id,),
+            ).fetchall()
+            return [self._row_to_dataset_result(r) for r in rows]
+
+    @staticmethod
+    def _row_to_dataset_result(row: sqlite3.Row) -> DatasetResult:
+        return DatasetResult(
+            id=row["id"],
+            version_id=row["version_id"],
+            manifest_path=row["manifest_path"],
+            output_path=row["output_path"],
+            columns=json.loads(row["columns_json"]),
+            start_date=row["start_date"],
+            end_date=row["end_date"],
+            frequency=row["frequency"],
+            adf_results=json.loads(row["adf_json"]),
+            warnings=json.loads(row["warnings_json"]),
+            created_at=_str_to_dt(row["created_at"]),
         )

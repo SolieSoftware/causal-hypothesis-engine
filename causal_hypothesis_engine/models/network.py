@@ -11,8 +11,13 @@ from pydantic import BaseModel, Field
 
 class AdapterType(str, Enum):
     None_ = "none"
+    # Domain-agnostic: any CSV/Parquet with a declared outcome column.
+    Tabular = "Tabular"
     Insurance = "Insurance"
     Financial = "Financial"
+    # NOTE: Clinical has no implementation. `causal-engine new --adapter
+    # Clinical` is rejected up front rather than silently creating a network
+    # that can never be backtested.
     Clinical = "Clinical"
 
 
