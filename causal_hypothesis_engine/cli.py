@@ -794,22 +794,50 @@ def check(version_id: str, data: str, alpha: float) -> None:
 )
 @click.option("--no-open", is_flag=True, default=False,
               help="Write the file but do not open the browser.")
-def view(version_id: str, out: str | None, no_open: bool) -> None:
-    """Open an interactive 3D graph of a DAGVersion in the browser."""
+@click.option(
+    "--this-version-only",
+    is_flag=True,
+    default=False,
+    help="Embed only this version instead of the whole network's history.",
+)
+def view(
+    version_id: str, out: str | None, no_open: bool, this_version_only: bool
+) -> None:
+    """Open an interactive graph of a DAGVersion in the browser.
+
+    By default every version of the owning network is embedded, so the version
+    selector can switch between hypotheses without regenerating the file.
+    """
     import tempfile
     import webbrowser
 
     db = _get_db()
-    version = db.get_version(version_id)
-    if version is None:
-        console.print(
-            f"[bold red][ERROR][/bold red] Problem: Version [bold]{version_id}[/bold] not found.\n"
-            "  Fix: Run [bold]causal-engine list[/bold] to see available version IDs."
-        )
-        sys.exit(1)
+    version = _load_version_or_exit(db, version_id)
 
-    from .export import to_html_3d
-    html = to_html_3d(version)
+    versions = [version]
+    network_name = ""
+    open_index = 0
+    network = db.get_network(version.network_id)
+    if network is not None:
+        network_name = network.name
+        if not this_version_only:
+            siblings = db.get_versions_for_network(network.id)
+            if siblings:
+                # Keep chronological order so the v1/v2 labels match real
+                # lineage, and just point the viewer at the requested one.
+                versions = siblings
+                open_index = next(
+                    (
+                        i
+                        for i, c in enumerate(versions)
+                        if c.version_id == version.version_id
+                    ),
+                    0,
+                )
+
+    from .viewer import to_html
+
+    html = to_html(versions, network_name=network_name, open_index=open_index)
 
     if out:
         html_path = Path(out)
@@ -819,12 +847,16 @@ def view(version_id: str, out: str | None, no_open: bool) -> None:
             prefix=f"causal_dag_{version_id[:8]}_",
             delete=False,
         )
-        tmp.write(html.encode())
         tmp.close()
         html_path = Path(tmp.name)
 
-    html_path.write_text(html)
-    console.print(f"[green]✓[/green] Viewer written to [bold]{html_path}[/bold]")
+    # write_text with an explicit encoding: the page contains "·", "⊥" and "⚠",
+    # which blow up on a cp1252 or LANG=C default.
+    html_path.write_text(html, encoding="utf-8")
+    console.print(
+        f"[green]✓[/green] Viewer written to [bold]{html_path}[/bold] "
+        f"({len(versions)} version(s) embedded)"
+    )
 
     if not no_open:
         webbrowser.open(f"file://{html_path.resolve()}")

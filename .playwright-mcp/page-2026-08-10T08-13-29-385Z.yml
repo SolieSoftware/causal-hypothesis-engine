@@ -1,0 +1,32 @@
+- generic [active] [ref=f4e1]:
+  - generic [ref=f4e2]:
+    - heading "Flood severity — Carbon book" [level=1] [ref=f4e3]
+    - combobox "Switch version" [ref=f4e4]:
+      - option "v1 · 1a3559e1 · Draft" [selected]
+      - option "v2 · bb1a2597 · Tested"
+    - generic [ref=f4e5]: 5 nodes · 4 edges · Draft
+    - textbox "Search nodes…" [ref=f4e6]
+    - button "Layered" [ref=f4e7] [cursor=pointer]
+    - button "Labels" [ref=f4e8] [cursor=pointer]
+    - button "Fit" [ref=f4e9] [cursor=pointer]
+  - generic [ref=f4e10]: "Left-click: rotate, Mouse-wheel/middle-click: zoom, Right-click: pan"
+  - generic:
+    - generic: Rainfall
+    - generic: Flood Zone
+    - generic: Flood Risk
+    - generic: Property Age
+    - generic: Large Claim
+  - generic [ref=f4e15]:
+    - heading "Node type" [level=2] [ref=f4e16]
+    - generic [ref=f4e17]: Exposure
+    - generic [ref=f4e19]: Outcome
+    - generic [ref=f4e21]: Confounder
+    - generic [ref=f4e23]: Mediator
+    - generic [ref=f4e25]: Collider
+    - separator [ref=f4e27]
+    - heading "Size = measurability" [level=2] [ref=f4e28]
+    - generic [ref=f4e29]: Hypothetical
+    - generic [ref=f4e31]: Identified
+    - generic [ref=f4e33]: Proxied
+    - generic [ref=f4e35]: Validated
+  - generic [ref=f4e37]: drag to rotate · scroll to zoom · right-drag to pan · click a node to inspect

@@ -1,0 +1,23 @@
+- generic [active] [ref=f3e1]:
+  - generic [ref=f3e2]:
+    - heading "DAG Viewer" [level=1] [ref=f3e3]
+    - generic [ref=f3e4]: version bb1a2597 · 5 nodes · 5 edges
+  - generic [ref=f3e5]:
+    - heading "Node Type" [level=3] [ref=f3e6]
+    - generic [ref=f3e7]: Exposure
+    - generic [ref=f3e10]: Outcome
+    - generic [ref=f3e13]: Confounder
+    - generic [ref=f3e16]: Mediator
+    - generic [ref=f3e19]: Collider
+    - generic [ref=f3e22]:
+      - heading "Size = Measurability" [level=3] [ref=f3e23]
+      - generic [ref=f3e24]:
+        - generic [ref=f3e25]: ● small
+        - generic [ref=f3e26]: Hypothetical
+      - generic [ref=f3e27]:
+        - generic [ref=f3e28]: ● large
+        - generic [ref=f3e29]: Validated
+  - generic [ref=f3e30]:
+    - button "Fit to screen" [ref=f3e31] [cursor=pointer]
+    - button "Toggle labels" [ref=f3e32] [cursor=pointer]
+  - generic [ref=f3e33]: "Left-click: rotate, Mouse-wheel/middle-click: zoom, Right-click: pan"
