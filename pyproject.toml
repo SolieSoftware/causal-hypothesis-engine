@@ -8,13 +8,21 @@ version = "0.1.0"
 description = "A domain-agnostic, human-in-the-loop system for constructing, versioning, and experimenting with causal hypothesis networks."
 requires-python = ">=3.12"
 dependencies = [
-    "pydantic-ai>=0.0.14",
-    "pydantic>=2.0",
-    "click>=8.0",
-    "rich>=13.0",
-    "anthropic>=0.40.0",
-    "pandas>=2.0",
+    "pydantic>=2.0,<3",
+    "click>=8.0,<9",
+    "rich>=13.0,<16",
+    "anthropic>=0.40.0,<1",
+    "pandas>=2.0,<4",
     "pyarrow>=14.0",
+    # Required for backtest scoring. Not optional: without it the adapter
+    # cannot compute AUC, and silently reporting a different metric under the
+    # AUC label is worse than failing loudly.
+    "scikit-learn>=1.3,<2",
+    # Imported directly by analysis.py for the partial-correlation p-value.
+    # Guaranteed transitively by scikit-learn, but declared because we use it.
+    "scipy>=1.10,<2",
+    # Required for graph invariants (acyclicity) and d-separation.
+    "networkx>=3.0,<4",
 ]
 
 [project.optional-dependencies]
@@ -30,7 +38,6 @@ financial = [
 ]
 dev = [
     "pytest>=8.0",
-    "pytest-asyncio>=0.23",
 ]
 
 [project.scripts]
@@ -38,3 +45,9 @@ causal-engine = "causal_hypothesis_engine.cli:cli"
 
 [tool.hatch.build.targets.wheel]
 packages = ["causal_hypothesis_engine"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = [
+    "ignore::DeprecationWarning:pydantic.*",
+]

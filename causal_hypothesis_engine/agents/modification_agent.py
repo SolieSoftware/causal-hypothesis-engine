@@ -22,6 +22,8 @@ from __future__ import annotations
 import json
 from copy import deepcopy
 from datetime import datetime
+
+from .._time import utcnow
 from pathlib import Path
 from typing import Any
 
@@ -117,13 +119,35 @@ Propose modifications — one at a time — using this schema:
   }
 }
 
+CRITICAL — what predictive contribution does and does not tell you:
+
+The backtest measures PREDICTIVE lift, not causal validity. These come apart, \
+and in a specific direction you must guard against:
+
+- A CONFOUNDER often adds little predictive lift yet must be retained — it is \
+  what makes an effect estimate valid. Never propose removing a node because \
+  its contribution is small.
+- A COLLIDER, or any descendant of the outcome, typically adds a LOT of \
+  predictive lift while destroying identification. High contribution is a \
+  reason to check whether the node is a collider, not a reason to celebrate.
+- A MEDIATOR adds lift but conditioning on it blocks the very indirect effect \
+  you may be trying to measure.
+
 Guidance for data-driven proposals:
-- Nodes with NEGATIVE or ZERO contribution: consider removing them, \
-  reclassifying them, or finding better proxies.
-- Nodes with HIGH contribution: consider promoting their measurability_state \
-  toward Validated, or adding children that might explain the mechanism.
-- Low overall lift: suggest adding new nodes/edges that might capture \
-  unexplained variance in the outcome.
+- "inconclusive" means the confidence interval spans zero: the data cannot \
+  distinguish that node's contribution from nothing. It is NOT evidence of no \
+  effect, and NOT grounds for removal. Suggest more data or a better proxy.
+- A node excluded because its column is missing from the file has a \
+  contribution of zero for a purely mechanical reason. Check for a typo before \
+  drawing any inference.
+- Only propose removing a node on THEORETICAL grounds — you no longer believe \
+  the causal relationship — never because its measured contribution was low.
+- Never propose promoting a node to Validated on the basis of predictive \
+  contribution alone. Validation requires the node's implied conditional \
+  independencies to survive testing against data \
+  (`causal-engine check`), not a favourable AUC delta.
+- Low overall lift: suggest nodes/edges that might capture unexplained \
+  variance, and consider whether the outcome is measurable at all.
 
 node_type values: Exposure | Outcome | Confounder | Mediator | Collider
 measurability_state values: Hypothetical | Identified | Proxied | Validated
@@ -583,15 +607,11 @@ class ModificationAgent:
                 console.print(f"[red]✗[/red] Could not apply: {msg}")
             # Feed result back to LLM.
             ack = "accepted" if ok else f"rejected — {msg}"
-            self._record_exchange(
-                {"role": "user", "content": f"[Proposal {ack}]"},
-                {"role": "assistant", "content": ""},
-            )
+            self._record_exchange({"role": "user", "content": f"[Proposal {ack}]"})
         else:
             console.print("[yellow]Proposal rejected.[/yellow]")
             self._record_exchange(
-                {"role": "user", "content": "[Proposal rejected by user]"},
-                {"role": "assistant", "content": ""},
+                {"role": "user", "content": "[Proposal rejected by user]"}
             )
 
     # ------------------------------------------------------------------
@@ -720,12 +740,21 @@ class ModificationAgent:
     # ------------------------------------------------------------------
 
     def _record_exchange(
-        self, user_msg: dict[str, str], assistant_msg: dict[str, str]
+        self, user_msg: dict[str, str], assistant_msg: dict[str, str] | None = None
     ) -> None:
-        self.session.conversation_history.append(user_msg)
-        self.session.conversation_history.append(assistant_msg)
+        """Append a turn to the persisted conversation history.
+
+        Messages with empty content are dropped. The Anthropic Messages API
+        rejects empty text content blocks, and this history is replayed
+        verbatim on every subsequent turn — so a single empty placeholder
+        turn would break the rest of the session *and*, because the history
+        is persisted to SQLite and the checkpoint, break `resume` permanently.
+        """
+        for message in (user_msg, assistant_msg):
+            if message and str(message.get("content", "")).strip():
+                self.session.conversation_history.append(message)
         self.session.exchange_count += 1
-        self.session.last_activity = datetime.utcnow()
+        self.session.last_activity = utcnow()
         self.db.update_session(self.session)
 
     def _do_checkpoint(self) -> None:

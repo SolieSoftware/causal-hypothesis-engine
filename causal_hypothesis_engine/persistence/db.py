@@ -12,12 +12,15 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from causal_hypothesis_engine.models.backtest_result import BacktestResult
 from causal_hypothesis_engine.models.dag_version import DAGVersion, DAGVersionStatus
+from causal_hypothesis_engine.models.dataset_result import DatasetResult
 from causal_hypothesis_engine.models.edge import Edge
 from causal_hypothesis_engine.models.network import AdapterType, HypothesisNetwork
 from causal_hypothesis_engine.models.node import Node
@@ -81,9 +84,39 @@ _MIGRATIONS: list[tuple[int, str]] = [
         );
         """,
     ),
+    (
+        2,
+        # DatasetResult persistence. Datasets were previously written to disk
+        # as orphan Parquet files with no record in the database, so there was
+        # no way to answer "which data belongs to this hypothesis?".
+        """
+        CREATE TABLE IF NOT EXISTS dataset_results (
+            id            TEXT PRIMARY KEY,
+            version_id    TEXT NOT NULL,
+            manifest_path TEXT NOT NULL,
+            output_path   TEXT NOT NULL,
+            columns_json  TEXT NOT NULL,
+            start_date    TEXT NOT NULL,
+            end_date      TEXT NOT NULL,
+            frequency     TEXT NOT NULL,
+            adf_json      TEXT NOT NULL,
+            warnings_json TEXT NOT NULL,
+            created_at    TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_dataset_results_version
+            ON dataset_results(version_id);
+
+        CREATE INDEX IF NOT EXISTS idx_dag_versions_network
+            ON dag_versions(network_id);
+
+        CREATE INDEX IF NOT EXISTS idx_sessions_network
+            ON sessions(network_id);
+        """,
+    ),
 ]
 
-CURRENT_SCHEMA_VERSION = 1
+CURRENT_SCHEMA_VERSION = 2
 
 
 # ---------------------------------------------------------------------------
@@ -143,8 +176,12 @@ def _json_to_conv_history(raw: str) -> list[dict]:
 class Database:
     """SQLite-backed persistence layer.
 
-    Each public method opens its own connection via _connect() and closes it
-    on exit.  No connection object is stored on the instance.
+    Each public method opens its own connection via :meth:`_connect` — a
+    context manager that commits on success, rolls back on error, and
+    **always closes**. It previously returned a bare ``sqlite3.Connection``
+    used as ``with self._connect() as conn:``, which commits the transaction
+    but does not close the handle, so every repository call leaked a file
+    descriptor and a WAL reader.
     """
 
     def __init__(self, db_path: str | Path) -> None:
@@ -156,13 +193,48 @@ class Database:
     # Connection factory
     # ------------------------------------------------------------------
 
-    def _connect(self) -> sqlite3.Connection:
-        """Open a WAL-mode, foreign-key-enabled connection."""
+    def _open(self) -> sqlite3.Connection:
+        """Open a raw connection with per-connection pragmas applied.
+
+        ``journal_mode=WAL`` is a persistent database property and is set once
+        in :meth:`_init_schema`; ``foreign_keys`` is per-connection and must be
+        set every time.
+        """
         conn = sqlite3.connect(str(self.db_path))
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys=ON")
         return conn
+
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        """Yield a connection, commit on success, roll back on error, always close."""
+        conn = self._open()
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def health(self) -> dict[str, str]:
+        """Return diagnostic facts about the database, for ``causal-engine doctor``.
+
+        Exists so the CLI does not have to reach into the connection factory.
+        """
+        info: dict[str, str] = {"db_path": str(self.db_path)}
+        with self._connect() as conn:
+            row = conn.execute("PRAGMA journal_mode").fetchone()
+            info["journal_mode"] = str(row[0]) if row else "unknown"
+            try:
+                row = conn.execute(
+                    "SELECT version FROM schema_version LIMIT 1"
+                ).fetchone()
+                info["schema_version"] = str(row[0]) if row else "unset"
+            except sqlite3.Error as exc:
+                info["schema_version"] = f"error: {exc}"
+        return info
 
     # ------------------------------------------------------------------
     # Schema initialisation & migrations
@@ -170,6 +242,9 @@ class Database:
 
     def _init_schema(self) -> None:
         with self._connect() as conn:
+            # WAL is a persistent database property — set once here rather than
+            # incurring a disk write on every repository call.
+            conn.execute("PRAGMA journal_mode=WAL")
             self._run_migrations(conn)
 
     def _run_migrations(self, conn: sqlite3.Connection) -> None:
@@ -483,4 +558,63 @@ class Database:
             created_at=_str_to_dt(row["created_at"]),
             last_activity=_str_to_dt(row["last_activity"]),
             exchange_count=row["exchange_count"],
+        )
+
+    # ------------------------------------------------------------------
+    # Dataset results
+    # ------------------------------------------------------------------
+
+    def save_dataset_result(self, result: DatasetResult) -> None:
+        """Insert or replace a DatasetResult row."""
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO dataset_results
+                    (id, version_id, manifest_path, output_path, columns_json,
+                     start_date, end_date, frequency, adf_json, warnings_json,
+                     created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    result.id,
+                    result.version_id,
+                    result.manifest_path,
+                    result.output_path,
+                    json.dumps(result.columns),
+                    result.start_date,
+                    result.end_date,
+                    result.frequency,
+                    json.dumps(result.adf_results),
+                    json.dumps(result.warnings),
+                    _dt_to_str(result.created_at),
+                ),
+            )
+
+    def get_dataset_results_for_version(self, version_id: str) -> list[DatasetResult]:
+        """Return every dataset built for *version_id*, newest first."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM dataset_results
+                WHERE version_id = ?
+                ORDER BY created_at DESC
+                """,
+                (version_id,),
+            ).fetchall()
+            return [self._row_to_dataset_result(r) for r in rows]
+
+    @staticmethod
+    def _row_to_dataset_result(row: sqlite3.Row) -> DatasetResult:
+        return DatasetResult(
+            id=row["id"],
+            version_id=row["version_id"],
+            manifest_path=row["manifest_path"],
+            output_path=row["output_path"],
+            columns=json.loads(row["columns_json"]),
+            start_date=row["start_date"],
+            end_date=row["end_date"],
+            frequency=row["frequency"],
+            adf_results=json.loads(row["adf_json"]),
+            warnings=json.loads(row["warnings_json"]),
+            created_at=_str_to_dt(row["created_at"]),
         )

@@ -30,8 +30,10 @@ from pathlib import Path
 from typing import Any
 
 from ..adapters.base import AdapterBase
+from ..adapters.financial import FinancialDataAdapter
 from ..adapters.insurance import InsuranceClaimsAdapter
-from ..models.backtest_result import BacktestResult
+from ..adapters.tabular import TabularAdapter
+from ..models.backtest_result import BacktestResult, NodeContribution
 from ..models.dag_version import DAGVersion, DAGVersionStatus
 from ..models.network import AdapterType, HypothesisNetwork
 from ..models.node import MeasurabilityState
@@ -45,10 +47,14 @@ logger = logging.getLogger(__name__)
 
 _ADAPTER_REGISTRY: dict[AdapterType, type[AdapterBase]] = {
     AdapterType.Insurance: InsuranceClaimsAdapter,
+    AdapterType.Tabular: TabularAdapter,
+    AdapterType.Financial: FinancialDataAdapter,
 }
 
 
-def get_adapter(adapter_type: AdapterType) -> AdapterBase:
+def get_adapter(
+    adapter_type: AdapterType, outcome_column: str | None = None
+) -> AdapterBase:
     """Return an instantiated adapter for *adapter_type*.
 
     Raises:
@@ -60,6 +66,10 @@ def get_adapter(adapter_type: AdapterType) -> AdapterBase:
             f"No adapter registered for AdapterType.{adapter_type.value}. "
             f"Available: {[t.value for t in _ADAPTER_REGISTRY]}"
         )
+    # Adapters that need an explicit outcome accept it; the insurance adapter
+    # derives its own, so it takes no argument.
+    if outcome_column is not None and cls is not InsuranceClaimsAdapter:
+        return cls(outcome_column)  # type: ignore[call-arg]
     return cls()
 
 
@@ -93,25 +103,32 @@ def check_can_backtest(
         )
 
     if network.adapter not in _ADAPTER_REGISTRY:
+        available = ", ".join(sorted(a.value for a in _ADAPTER_REGISTRY))
         raise BacktestPreflightError(
-            f"Problem: Adapter '{network.adapter.value}' is not yet implemented.\n"
-            "  Cause: Only Insurance is available in v1.\n"
-            "  Fix: Use --adapter Insurance."
+            f"Problem: Adapter '{network.adapter.value}' has no implementation.\n"
+            f"  Cause: Scoring is available for: {available}.\n"
+            "  Fix: Create the network with one of those adapters."
         )
 
-    proxied = [
-        n for n in version.nodes
-        if n.measurability_state == MeasurabilityState.Proxied
-        and n.adapter_metadata
-        and n.adapter_metadata.get("proxy_variables")
-    ]
-    if not proxied:
-        raise BacktestPreflightError(
-            "Problem: No Proxied nodes with proxy_variables found in this version.\n"
-            "  Cause: BacktestAgent needs at least one node with measurability_state "
-            "= Proxied and proxy_variables set in its adapter_metadata.\n"
-            "  Fix: Update node measurability states and add proxy_variables."
-        )
+    # The Financial adapter matches nodes to dataset columns by label, so it
+    # does not require explicit binding; the others do.
+    if network.adapter != AdapterType.Financial:
+        measured = [
+            n for n in version.nodes
+            if n.measurability_state
+            in (MeasurabilityState.Proxied, MeasurabilityState.Validated)
+            and n.adapter_metadata
+            and n.adapter_metadata.get("proxy_variables")
+        ]
+        if not measured:
+            raise BacktestPreflightError(
+                "Problem: No node in this version is bound to a data column.\n"
+                "  Cause: Scoring needs at least one node with "
+                "measurability_state Proxied or Validated and proxy_variables "
+                "set.\n"
+                "  Fix: causal-engine bind <version-id> --node <label> "
+                "--column <column>"
+            )
 
     if version.is_immutable:
         raise BacktestPreflightError(
@@ -143,12 +160,14 @@ class BacktestAgent:
         network: HypothesisNetwork,
         version: DAGVersion,
         data_path: str | Path,
+        outcome_column: str | None = None,
     ) -> None:
         self.db = db
         self.network = network
         self.version = version
         self.data_path = Path(data_path)
-        self.adapter = get_adapter(network.adapter)
+        self.outcome_column = outcome_column
+        self.adapter = get_adapter(network.adapter, outcome_column=outcome_column)
 
     # ------------------------------------------------------------------
     # Public: run the automated pipeline
@@ -197,9 +216,19 @@ class BacktestAgent:
             raise ValueError(f"Data validation failed: {errors}")
         console.print("[dim]  Validation passed.[/dim]")
 
+        for warning in getattr(self.adapter, "data_warnings", lambda _: [])(df):
+            console.print(f"[yellow][WARN][/yellow] {warning}")
+
+        # 2b. Resolve the outcome column. Adapters with a fixed schema derive
+        # it themselves; the generic and financial adapters need it declared.
+        if hasattr(self.adapter, "resolve_outcome"):
+            self.adapter.resolve_outcome(df, self.version)
+
         # 3. Build proxy features
         console.print("[dim]Building proxy features...[/dim]")
         proxy_features = self.adapter.build_proxy_features(df, self.version)
+        for warning in getattr(self.adapter, "feature_warnings", []):
+            console.print(f"[yellow][WARN][/yellow] {warning}")
         proxied_count = len([
             n for n in self.version.nodes
             if n.measurability_state == MeasurabilityState.Proxied
@@ -215,14 +244,51 @@ class BacktestAgent:
         outcome_col = self.adapter.outcome_column(df)
         console.print(f"[dim]Scoring (outcome: '{outcome_col}')...[/dim]")
 
-        baseline_score = self.adapter.compute_baseline_score(df, outcome_col)
-        dag_score, node_contributions = self.adapter.compute_dag_score(
-            df, proxy_features, outcome_col
-        )
+        # `score_detail` returns the same scores plus the provenance and
+        # bootstrap intervals needed to interpret them. Adapters that predate
+        # it fall back to the plain interface.
+        node_map = {n.id: n.label for n in self.version.nodes}
+        if hasattr(self.adapter, "score_detail"):
+            detail = self.adapter.score_detail(df, proxy_features, outcome_col)
+            baseline_score = detail["baseline_score"]
+            dag_score = detail["dag_score"]
+            node_contributions = detail["node_contributions"]
+            lift_ci = detail.get("lift_ci", (None, None))
+            node_detail = detail.get("node_detail", {})
+            metric_name = detail.get("metric_name", "unknown")
+            extra = {
+                "metric_name": metric_name,
+                "n_rows": detail.get("n_rows", 0),
+                "n_positive": detail.get("n_positive", 0),
+                "n_features_baseline": detail.get("n_features_baseline", 0),
+                "n_features_dag": detail.get("n_features_dag", 0),
+                "cv_scheme": detail.get("cv_scheme", ""),
+                "random_seed": 42,
+                "lift_ci_low": lift_ci[0],
+                "lift_ci_high": lift_ci[1],
+            }
+        else:  # pragma: no cover - legacy adapter path
+            baseline_score = self.adapter.compute_baseline_score(df, outcome_col)
+            dag_score, node_contributions = self.adapter.compute_dag_score(
+                df, proxy_features, outcome_col
+            )
+            node_detail = {}
+            extra = {}
+
         lift = dag_score - baseline_score
 
+        contributions = [
+            NodeContribution(
+                node_id=node_id,
+                node_label=node_map.get(node_id, node_id[:8]),
+                contribution=round(value, 6),
+                ci_low=node_detail.get(node_id, (None, None))[0],
+                ci_high=node_detail.get(node_id, (None, None))[1],
+            )
+            for node_id, value in node_contributions.items()
+        ]
+
         # 5. Build result
-        notes = self._build_notes(node_contributions)
         result = BacktestResult(
             version_id=self.version.version_id,
             adapter_type=self.network.adapter.value,
@@ -230,7 +296,9 @@ class BacktestAgent:
             dag_score=round(dag_score, 6),
             lift=round(lift, 6),
             node_contributions={k: round(v, 6) for k, v in node_contributions.items()},
-            notes=notes,
+            contributions=contributions,
+            notes=self._build_notes(contributions),
+            **extra,
         )
 
         # 6. Persist — attach result, transition to Tested
@@ -252,56 +320,105 @@ class BacktestAgent:
         from rich.panel import Panel
         from rich.table import Table
 
-        lift_color = "green" if result.lift >= 0 else "red"
+        # Colour by significance, not by sign. A lift whose interval spans zero
+        # is not evidence of anything, and rendering it green because it
+        # happened to land above zero is how a graph of pure noise produces
+        # confident findings.
+        if result.lift_is_significant:
+            lift_color = "green" if result.lift > 0 else "red"
+        else:
+            lift_color = "yellow"
         lift_sign = "+" if result.lift >= 0 else ""
+
+        if result.lift_ci_low is not None:
+            interval = (
+                f"  [95% CI {result.lift_ci_low:+.4f} to {result.lift_ci_high:+.4f}]"
+            )
+            if not result.lift_is_significant:
+                interval += "  [yellow](spans zero)[/yellow]"
+        else:
+            interval = ""
+
+        provenance = ""
+        if result.metric_name != "unknown":
+            provenance = (
+                f"\nMetric:          {result.metric_name}\n"
+                f"Sample:          {result.n_rows:,} rows, "
+                f"{result.n_positive:,} positive\n"
+                f"CV:              {result.cv_scheme}\n"
+            )
 
         console.print(
             Panel(
                 f"Baseline score:  {result.baseline_score:.4f}\n"
                 f"DAG score:       {result.dag_score:.4f}\n"
-                f"Lift:            [{lift_color}]{lift_sign}{result.lift:.4f}[/{lift_color}]\n\n"
+                f"Lift:            [{lift_color}]{lift_sign}{result.lift:.4f}"
+                f"[/{lift_color}]{interval}\n"
+                f"{provenance}\n"
                 f"{self.adapter.describe_lift()}",
                 title="[bold]Backtest Result[/bold]",
             )
         )
 
-        if result.node_contributions:
+        if result.contributions:
             table = Table(title="Node Contributions", show_lines=False)
             table.add_column("Node ID", style="dim")
             table.add_column("Node Label")
             table.add_column("Contribution", justify="right")
-            table.add_column("Signal?", justify="center")
+            table.add_column("95% CI", justify="center")
+            table.add_column("Verdict", justify="center")
 
-            node_map = {n.id: n.label for n in self.version.nodes}
-            sorted_contribs = sorted(
-                result.node_contributions.items(), key=lambda x: x[1], reverse=True
-            )
-            for node_id, contrib in sorted_contribs:
-                label = node_map.get(node_id, node_id[:8])
-                contrib_str = f"{contrib:+.4f}"
-                signal = "[green]yes[/green]" if contrib > 0 else "[red]no[/red]"
-                table.add_row(node_id[:8], label, contrib_str, signal)
+            styles = {
+                "positive": "[green]adds signal[/green]",
+                "negative": "[red]hurts[/red]",
+                "inconclusive": "[yellow]inconclusive[/yellow]",
+            }
+            for item in sorted(
+                result.contributions, key=lambda c: c.contribution, reverse=True
+            ):
+                ci = (
+                    f"{item.ci_low:+.4f} … {item.ci_high:+.4f}"
+                    if item.ci_low is not None
+                    else "—"
+                )
+                table.add_row(
+                    item.node_id[:8],
+                    item.node_label,
+                    f"{item.contribution:+.4f}",
+                    ci,
+                    styles[item.verdict],
+                )
             console.print(table)
+            console.print(
+                "[dim]'inconclusive' means the interval spans zero — the data "
+                "cannot distinguish this node's contribution from nothing. It is "
+                "not grounds to remove the node.[/dim]"
+            )
 
         console.print(
             f"\n[bold green]Version {self.version.version_id[:8]} → Tested[/bold green]"
         )
 
-    def _build_notes(self, node_contributions: dict[str, float]) -> str:
-        node_map = {n.id: n.label for n in self.version.nodes}
-        added_signal = [
-            node_map.get(nid, nid[:8])
-            for nid, contrib in node_contributions.items()
-            if contrib > 0
-        ]
-        no_signal = [
-            node_map.get(nid, nid[:8])
-            for nid, contrib in node_contributions.items()
-            if contrib <= 0
-        ]
-        parts = []
-        if added_signal:
-            parts.append(f"Added signal: {', '.join(added_signal)}.")
-        if no_signal:
-            parts.append(f"No signal: {', '.join(no_signal)}.")
+    def _build_notes(self, contributions: list[NodeContribution]) -> str:
+        """Summarise contributions by *verdict*, not by sign.
+
+        These notes are fed verbatim into the ModificationAgent's context, so
+        a sign-based "no signal" label here becomes the LLM's justification for
+        proposing that a node be deleted. Only a node whose interval lies
+        wholly below zero has actually been shown to hurt.
+        """
+        buckets: dict[str, list[str]] = {"positive": [], "negative": [], "inconclusive": []}
+        for item in contributions:
+            buckets[item.verdict].append(item.node_label)
+
+        parts: list[str] = []
+        if buckets["positive"]:
+            parts.append(f"Adds signal: {', '.join(buckets['positive'])}.")
+        if buckets["negative"]:
+            parts.append(f"Hurts predictive performance: {', '.join(buckets['negative'])}.")
+        if buckets["inconclusive"]:
+            parts.append(
+                "Contribution indistinguishable from zero (NOT evidence of no "
+                f"effect): {', '.join(buckets['inconclusive'])}."
+            )
         return " ".join(parts)

@@ -22,6 +22,8 @@ import re
 import uuid
 from copy import deepcopy
 from datetime import datetime
+
+from .._time import utcnow
 from pathlib import Path
 from typing import Any
 
@@ -672,7 +674,7 @@ class DAGAgent:
         self.session.conversation_history.append(user_msg)
         self.session.conversation_history.append(assistant_msg)
         self.session.exchange_count += 1
-        self.session.last_activity = datetime.utcnow()
+        self.session.last_activity = utcnow()
         self.db.update_session(self.session)
 
     # ------------------------------------------------------------------

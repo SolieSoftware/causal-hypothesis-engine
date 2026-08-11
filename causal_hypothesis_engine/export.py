@@ -4,7 +4,8 @@ Supported formats:
   mermaid  — Mermaid flowchart syntax (renders in GitHub, Notion, etc.)
   dot      — Graphviz DOT format (render with: dot -Tsvg file.dot > file.svg)
   json     — Clean JSON (model_dump)
-  html     — Self-contained 3D interactive graph (opens in browser, no deps)
+  html     — 3D interactive graph (opens in browser; needs network access —
+             the two JS libraries are loaded from a pinned CDN)
 """
 
 from __future__ import annotations
@@ -167,9 +168,11 @@ def to_json(version: "DAGVersion") -> str:
 
 
 def to_html_3d(version: "DAGVersion") -> str:
-    """Return a self-contained HTML file with a 3D force-directed graph.
+    """Return an HTML page with a 3D force-directed graph.
 
-    Uses 3d-force-graph (CDN) — no pip dependencies.  Open in any browser.
+    No pip dependencies, but *not* self-contained: 3d-force-graph and
+    three-spritetext are fetched from unpkg at pinned versions, so the page is
+    blank offline. Open in any browser.
 
     Visual encoding:
       Colour  → node_type  (blue=Exposure, red=Outcome, orange=Confounder,
@@ -204,7 +207,15 @@ def to_html_3d(version: "DAGVersion") -> str:
             "description": edge.description,
         })
 
-    graph_data = json.dumps({"nodes": nodes_data, "links": links_data}, indent=2)
+    # json.dumps does not escape "<", ">" or "/", so a node label containing
+    # "</script>" would terminate the script block and inject arbitrary HTML.
+    # Labels come from LLM tool output, so they are attacker-influenceable via
+    # prompt injection in whatever source material the agent read.
+    graph_data = (
+        json.dumps({"nodes": nodes_data, "links": links_data}, indent=2)
+        .replace("</", "<\\/")
+        .replace("<!--", "<\\!--")
+    )
 
     network_name = version.version_id[:8]
     node_count = len(version.nodes)
@@ -310,7 +321,12 @@ def to_html_3d(version: "DAGVersion") -> str:
 <div id="tooltip"></div>
 <div id="graph"></div>
 
-<script src="https://unpkg.com/3d-force-graph@1"></script>
+<!-- Both libraries load BEFORE the script that uses them. three-spritetext was
+     previously loaded after this block, so SpriteText was undefined when
+     nodeThreeObject first ran. Versions are pinned: an unpinned CDN tag is a
+     live third-party dependency executing against your research data. -->
+<script src="https://unpkg.com/3d-force-graph@1.73.4"></script>
+<script src="https://unpkg.com/three-spritetext@1.8.2"></script>
 <script>
 const graphData = {graph_data};
 
@@ -348,11 +364,24 @@ const graph = ForceGraph3D()(document.getElementById('graph'))
     const tt = document.getElementById('tooltip');
     if (node) {{
       tt.style.display = 'block';
-      tt.innerHTML = `
-        <div class="tt-label" style="color:${{node.color}}">${{node.label}}</div>
-        <div class="tt-type">${{node.type}} · ${{node.measurability}}</div>
-        ${{node.description ? `<div class="tt-desc">${{node.description}}</div>` : ''}}
-      `;
+      // textContent, not innerHTML: labels and descriptions are model-authored
+      // and must never be parsed as HTML.
+      tt.replaceChildren();
+      const labelEl = document.createElement('div');
+      labelEl.className = 'tt-label';
+      labelEl.style.color = node.color;
+      labelEl.textContent = node.label;
+      tt.appendChild(labelEl);
+      const typeEl = document.createElement('div');
+      typeEl.className = 'tt-type';
+      typeEl.textContent = node.type + ' · ' + node.measurability;
+      tt.appendChild(typeEl);
+      if (node.description) {{
+        const descEl = document.createElement('div');
+        descEl.className = 'tt-desc';
+        descEl.textContent = node.description;
+        tt.appendChild(descEl);
+      }}
     }} else {{
       tt.style.display = 'none';
     }}
@@ -386,8 +415,6 @@ function toggleLabels() {{
   }});
 }}
 
-// Import SpriteText from the same CDN bundle
 </script>
-<script src="https://unpkg.com/three-spritetext"></script>
 </body>
 </html>"""

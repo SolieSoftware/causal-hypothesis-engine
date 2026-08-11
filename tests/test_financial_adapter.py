@@ -637,14 +637,71 @@ def test_adapter_identity() -> None:
     assert adapter.adapter_type == AdapterType.Financial
 
 
-def test_adapter_outcome_column_raises() -> None:
+def test_adapter_outcome_column_requires_resolution() -> None:
+    """Unresolved outcome is an actionable error, not NotImplementedError."""
+    from causal_hypothesis_engine.scoring import ScoringError
+
     adapter = FinancialDataAdapter()
-    with pytest.raises(NotImplementedError):
+    with pytest.raises(ScoringError, match="has not been resolved"):
         adapter.outcome_column(pd.DataFrame())
 
 
-def test_adapter_compute_dag_score_returns_zero() -> None:
+def test_adapter_scores_a_real_dataset() -> None:
+    """Financial scoring is implemented — it used to return a hardcoded 0.0."""
+    import numpy as np
+
+    from causal_hypothesis_engine.models import DAGVersion, Edge, Node
+    from causal_hypothesis_engine.models.node import MeasurabilityState, NodeType
+
+    rng = np.random.default_rng(7)
+    n = 300
+    driver = rng.normal(size=n)
+    noise = rng.normal(size=n)
+    df = pd.DataFrame(
+        {
+            "Driver": driver,
+            "Noise": noise,
+            "Outcome": 2.0 * driver + rng.normal(scale=0.5, size=n),
+        },
+        index=pd.date_range("2015-01-01", periods=n, freq="W"),
+    )
+
+    driver_node = Node(
+        label="Driver",
+        node_type=NodeType.Exposure,
+        measurability_state=MeasurabilityState.Proxied,
+    )
+    noise_node = Node(
+        label="Noise",
+        node_type=NodeType.Exposure,
+        measurability_state=MeasurabilityState.Proxied,
+    )
+    outcome_node = Node(label="Outcome", node_type=NodeType.Outcome)
+    version = DAGVersion(
+        network_id="net-1",
+        nodes=[driver_node, noise_node, outcome_node],
+        edges=[Edge(source_node_id=driver_node.id, target_node_id=outcome_node.id)],
+    )
+
     adapter = FinancialDataAdapter()
-    score, contrib = adapter.compute_dag_score(pd.DataFrame(), pd.DataFrame(), "col")
-    assert score == 0.0
-    assert contrib == {}
+    outcome_col = adapter.resolve_outcome(df, version)
+    assert outcome_col == "Outcome"
+
+    features = adapter.build_proxy_features(df, version)
+    detail = adapter.score_detail(df, features, outcome_col)
+
+    assert detail["metric_name"] == "out-of-fold R²"
+    assert detail["dag_score"] > 0.5, "a strong linear driver should be recovered"
+
+    # The real driver contributes substantially, with an interval well above
+    # zero. Pure noise contributes ~0 — very slightly negative, because an
+    # uninformative feature costs a little out-of-fold R². What matters is the
+    # order of magnitude between them.
+    driver_ci = detail["node_detail"][driver_node.id]
+    assert driver_ci[0] is not None and driver_ci[0] > 0
+
+    driver_contribution = detail["node_contributions"][driver_node.id]
+    noise_contribution = detail["node_contributions"][noise_node.id]
+    assert driver_contribution > 0.5
+    assert abs(noise_contribution) < 0.01
+    assert abs(noise_contribution) < driver_contribution / 50

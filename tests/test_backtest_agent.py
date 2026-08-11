@@ -138,15 +138,21 @@ class TestCheckCanBacktest:
         with pytest.raises(BacktestPreflightError, match="no adapter"):
             check_can_backtest(network, version)
 
-    def test_fails_unregistered_adapter(self) -> None:
+    def test_financial_adapter_is_registered(self) -> None:
+        """Financial scoring is implemented, so preflight must not block it."""
         network = _make_network(AdapterType.Financial)
         version = _make_version_with_proxied(network.id)
-        with pytest.raises(BacktestPreflightError, match="not yet implemented"):
+        check_can_backtest(network, version)
+
+    def test_fails_unimplemented_adapter(self) -> None:
+        network = _make_network(AdapterType.Clinical)
+        version = _make_version_with_proxied(network.id)
+        with pytest.raises(BacktestPreflightError, match="no implementation"):
             check_can_backtest(network, version)
 
-    def test_fails_no_proxied_nodes(self, network: HypothesisNetwork) -> None:
+    def test_fails_no_bound_nodes(self, network: HypothesisNetwork) -> None:
         version = _make_version_no_proxied(network.id)
-        with pytest.raises(BacktestPreflightError, match="No Proxied nodes"):
+        with pytest.raises(BacktestPreflightError, match="bound to a data column"):
             check_can_backtest(network, version)
 
     def test_fails_already_tested(self, network: HypothesisNetwork) -> None:
